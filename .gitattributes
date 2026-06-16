@@ -1,0 +1,3 @@
+# Normalize all text files to LF in the repo and on checkout.
+# Prevents CRLF (Windows) line endings from re-entering and showing as ^M in diffs.
+* text=auto eol=lf

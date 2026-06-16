@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 from typing import List, Dict
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from mcp.server.models import InitializationOptions
 import mcp.types as types
@@ -34,8 +33,19 @@ class SmartConnectionsDatabase:
         self.embeddings_loaded = False  # Lazy loading flag
 
     def ensure_model_loaded(self):
-        """Lazy load the embedding model on first use"""
+        """Lazy load the embedding model on first use.
+
+        torch/sentence_transformers are imported here, not at module top,
+        so a server instance that never runs a search never pays the
+        ~6s CPU / ~860MB RAM import cost. Threads capped to 1: encoding a
+        single short query against an in-memory cache gains nothing from
+        intra-op parallelism and only contends across instances.
+        """
         if self.model is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
+
+            torch.set_num_threads(1)
             self.model = SentenceTransformer(self.model_name)
 
     def load_embeddings(self):
