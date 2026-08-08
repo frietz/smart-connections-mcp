@@ -431,6 +431,33 @@ class AtomicPublish(unittest.TestCase):
         self.assertEqual(self.db.embed_at, {"a.md": 10.0, "b.md": 20.0})
         self.assertEqual(self.db.paths, ["a.md", "b.md"])
 
+    def test_a_load_that_fails_AFTER_reading_embed_times_touches_nothing(self):
+        # The two cases above both return before the ref loop runs, so neither
+        # actually exercises the bug: they pass just as happily against the
+        # version that wrote embed_at incrementally. This one has valid refs -
+        # so the buggy version records embed times - and then fails at the blob,
+        # which is the real shape of a retry losing to a mid-write store.
+        fp = "mf_probe"
+        (self.tmp / "smart_sources").mkdir(exist_ok=True)
+        rng = np.random.default_rng(3)
+        write_blob(self.tmp / "smart_sources" / fp,
+                   rng.standard_normal((4, 384)) * 9.0)   # not unit: refused
+        p = self.tmp / "smart_sources.ajson"
+        p.write_text(json.dumps("smart_sources:x.md")[:-1] + '": ' + json.dumps({
+            "path": "x.md",
+            "embedding": {"default": {fp: {"file_i": 0, "at": 12345.0}}},
+        }) + ",\n", encoding="utf-8")
+        self.db.sources_ajson = p
+        self.db.sources_dir = self.tmp / "smart_sources"
+        self.db.blocks_dir = self.tmp / "smart_blocks"
+
+        self.assertFalse(self.db._load_modern())
+        self.assertEqual(self.db.embed_at, {"a.md": 10.0, "b.md": 20.0},
+                         "a failed load recorded embed times for a matrix it "
+                         "never published")
+        self.assertNotIn("x.md", self.db.embed_at)
+        self.assertEqual(self.db.paths, ["a.md", "b.md"])
+
 
 class ModelReverification(unittest.TestCase):
     """The re-check must arm on the warm path and survive a transient error.
