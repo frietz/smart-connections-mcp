@@ -93,8 +93,14 @@ class SmartConnectionsDatabase:
         # variant (384-dim) and it is the ceiling on retrieval precision here -
         # measured 2026-08-08, a question answered verbatim in a note still
         # ranked ~500th. Switching the model in Obsidian's Smart Connections
-        # settings and letting it re-embed is what raises that ceiling; this
-        # server then follows automatically.
+        # settings and letting it re-embed is what raises that ceiling.
+        #
+        # The name is resolved ONCE, here. A process started before a model
+        # switch keeps embedding into the old space for its whole life - it
+        # does not follow the change, it only refuses to mix the two (the
+        # cache fingerprint and the top-up cache both carry the model name).
+        # Reconnect the server after switching. _refresh_if_stale re-reads the
+        # setting on its throttle and says so rather than drifting silently.
         self.model = None
         self.model_name = self._configured_model()
 
@@ -116,6 +122,7 @@ class SmartConnectionsDatabase:
         self._last_signature = None
         self._last_drain = 0.0     # when a top-up pass last ran
         self._deferred = False     # last pass left notes un-encoded
+        self._model_drift_warned = False
         self.topup_added = 0      # notes embedded here because SC was behind
         self.topup_superseded = 0 # stale SC rows dropped in favour of a top-up
         self.topup_skipped = 0    # over TOPUP_MAX_NOTES this run
@@ -232,7 +239,11 @@ class SmartConnectionsDatabase:
             total += st.st_size
             if st.st_mtime > newest:
                 newest = st.st_mtime
-        raw = f"v{CACHE_VERSION}:{count}:{newest:.0f}:{total}:{self.model_name}"
+        # Sub-second precision on the mtime: truncating to whole seconds lets a
+        # rewrite inside the same second that happens to preserve file count and
+        # total size reuse a stale matrix. Unlikely, but a bulk re-embed writes
+        # these files far faster than once a second.
+        raw = f"v{CACHE_VERSION}:{count}:{newest:.3f}:{total}:{self.model_name}"
         return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
     def _load_from_cache(self, fingerprint: str) -> bool:
@@ -456,6 +467,14 @@ class SmartConnectionsDatabase:
             return
         self._last_check = now
 
+        if not self._model_drift_warned and self._configured_model() != self.model_name:
+            self._model_drift_warned = True
+            print(f"WARNING: Smart Connections now uses "
+                  f"'{self._configured_model()}' but this process loaded "
+                  f"'{self.model_name}'. Vectors are not mixed, but results "
+                  f"come from the old space - reconnect the server.",
+                  file=sys.stderr)
+
         targets = self._stale_or_missing()
         signature = hashlib.sha256(
             "|".join(f"{r}:{m:.3f}" for r, m in sorted(targets)).encode()
@@ -591,6 +610,13 @@ class SmartConnectionsDatabase:
             matrix = np.load(vec_p, mmap_mode="r")
             if index.get("_model") != self.model_name:
                 return {}, None   # model changed: the vector space did too
+            # The pair is published as two replaces, so a reader can land
+            # between them. Row numbers alone would not catch it: they are
+            # validated only against the matrix bounds, so an index paired with
+            # a LARGER matrix passes and silently attaches other notes'
+            # vectors. The row count pins the two files to the same write.
+            if index.get("_rows") != int(matrix.shape[0]):
+                return {}, None
             return index.get("notes", {}), matrix
         except Exception:
             return {}, None
@@ -603,7 +629,9 @@ class SmartConnectionsDatabase:
             with open(tmp_vec, "wb") as f:
                 np.save(f, matrix)
             with open(tmp_idx, "w", encoding="utf-8") as f:
-                json.dump({"_model": self.model_name, "notes": notes}, f)
+                json.dump({"_model": self.model_name,
+                           "_rows": int(matrix.shape[0]),
+                           "notes": notes}, f)
             tmp_vec.replace(self.cache_dir / "topup.npy")
             tmp_idx.replace(self.cache_dir / "topup.json")
         except Exception:
@@ -751,7 +779,16 @@ class SmartConnectionsDatabase:
         add_rows = np.stack(add_vecs).astype(np.float32, copy=False)
         base = np.asarray(self.matrix)[keep]
         if base.shape[0] and base.shape[1] != add_rows.shape[1]:
-            return  # dimension mismatch: leave the base index untouched
+            # Leave the base index untouched - but say so. A bare return here
+            # was the one remaining silent failure in this path: the model had
+            # already loaded and encoded, so the run looked like work, while
+            # topup_added reported 0 with no reason given.
+            print(f"WARNING: top-up not merged - '{self.model_name}' produces "
+                  f"{add_rows.shape[1]}d vectors but the loaded index is "
+                  f"{base.shape[1]}d. {len(done)} notes were encoded and "
+                  f"discarded; reconnect the server so both are rebuilt in "
+                  f"one space.", file=sys.stderr)
+            return
 
         self.matrix = np.vstack([base, add_rows]) if base.shape[0] else add_rows
         self.keys = [self.keys[i] for i in keep] + add_keys
@@ -1197,9 +1234,20 @@ def reindex_cli() -> int:
     print(f"stale dropped  : {t['stale_rows_superseded']}")
     print(f"deferred       : {t['deferred_over_cap']}")
     print(f"elapsed        : {time.time() - start:.1f}s")
-    remaining = len(db._stale_or_missing())
-    print(f"still stale    : {remaining}"
-          + ("  <- all covered by the top-up cache" if remaining else ""))
+    # "Stale" is measured against Obsidian's own embed_at, which top-up never
+    # writes, so a fully drained vault still reports every note it covered.
+    # Report what that number means instead of annotating it backwards - the
+    # old line printed "all covered by the top-up cache" precisely when some
+    # were NOT covered, and omitted it when the count was zero.
+    remaining = db._stale_or_missing()
+    cached, _ = db._load_topup_cache()
+    covered = sum(
+        1 for r, m in remaining
+        if abs((cached.get(r) or {}).get("mtime", -1) - m) < 0.001
+    )
+    print(f"behind Obsidian: {len(remaining)}  "
+          f"({covered} covered by the top-up cache, "
+          f"{len(remaining) - covered} not)")
     return 0
 
 
