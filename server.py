@@ -518,6 +518,39 @@ class SmartConnectionsDatabase:
         flush(len(lines))
         return chunks[:TOPUP_MAX_CHUNKS]
 
+    @staticmethod
+    def _with_source_chunk(chunks: List[dict]) -> List[dict]:
+        """Guarantee one note-level (`smart_sources:`) row per topped-up note.
+
+        Heading-scoped chunking only produces an empty-heading chunk when a
+        note opens with prose. Notes here open with frontmatter and then their
+        H1, so nearly every one yields blocks and nothing else - and since a
+        topped-up note supersedes its ENTIRE Smart Connections representation,
+        that dropped the source row Obsidian had written. find_related both
+        anchors on that row and ranks only source rows, so a topped-up note
+        became invisible to it in both directions; index_stats' source count
+        fell with it. Verified 2026-08-09: CLAUDE.md, README.md, _MOC.md and a
+        daily note all chunk to 0 empty-heading chunks.
+
+        The note vector is pooled from the chunk vectors rather than encoded a
+        second time. That costs nothing, and it avoids re-imposing the encoder
+        truncation that per-heading chunking exists to escape - a whole-note
+        encode of this file scored 0.533 at rank 21,796 for a question its own
+        text answers. Pooled unit vectors stay in the same space, so the row
+        remains comparable with Obsidian's own source rows.
+        """
+        if not chunks or any((c.get("heading") or "") == "" for c in chunks):
+            return chunks
+        pooled = np.mean(
+            [np.asarray(c["vec"], dtype=np.float32) for c in chunks], axis=0
+        )
+        n = float(np.linalg.norm(pooled))
+        if not np.isfinite(n) or n == 0.0:
+            return chunks
+        # lines None: _read_text falls back to the whole note, which is what a
+        # note-level row should return.
+        return chunks + [{"heading": "", "lines": None, "vec": pooled / n}]
+
     def _load_topup_cache(self):
         """Return (index, matrix). Vectors live in .npy, never in the JSON.
 
@@ -678,7 +711,8 @@ class SmartConnectionsDatabase:
         new_index: Dict[str, dict] = {}
         for rel, entry in done.items():
             rows = []
-            for c in entry["chunks"]:
+            chunks = self._with_source_chunk(entry["chunks"])
+            for c in chunks:
                 h = c.get("heading") or ""
                 add_keys.append(f"smart_blocks:{rel}#{h}" if h else f"smart_sources:{rel}")
                 add_paths.append(rel)
