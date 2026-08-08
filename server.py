@@ -143,10 +143,13 @@ class SmartConnectionsDatabase:
         self._last_drain = 0.0     # when a top-up pass last ran
         self._deferred = False     # last pass left notes un-encoded
         self._model_drift_warned = False
-        self.topup_added = 0      # notes embedded here because SC was behind
+        self.topup_added = 0      # ROWS added by top-up this pass
         self.topup_superseded = 0 # stale SC rows dropped in favour of a top-up
         self.topup_skipped = 0    # over TOPUP_MAX_NOTES this run
         self.rows_dropped = 0     # rows removed for notes deleted since load
+        self.topup_notes = 0      # DISTINCT notes covered, as opposed to rows
+        self._probe_material = None   # (fingerprint, note text, stored vector)
+        self._verified_model = False
 
     DEFAULT_MODEL = 'TaylorAI/bge-micro-v2'
 
@@ -239,6 +242,18 @@ class SmartConnectionsDatabase:
         if not blobs:
             return None
         return max(blobs, key=lambda p: p.stat().st_mtime).name
+
+    @staticmethod
+    def _newest_fingerprint(entries: Dict[str, dict]) -> Optional[str]:
+        """The embedding space with the most recent `at`, across all sources."""
+        best, best_at = None, -1.0
+        for item in entries.values():
+            slots = ((item.get("embedding") or {}).get("default") or {})
+            for name, slot in slots.items():
+                at = slot.get("at") if isinstance(slot, dict) else None
+                if isinstance(at, (int, float)) and at > best_at:
+                    best, best_at = name, float(at)
+        return best
 
     def _model_map_path(self) -> Path:
         return self.cache_dir / "fingerprint-models.json"
@@ -345,7 +360,23 @@ class SmartConnectionsDatabase:
         return best
 
     def _open_blob(self, path: Path, min_rows: int) -> Optional[np.ndarray]:
-        """mmap a flat float32 blob as (rows, dim), deriving dim from its size."""
+        """mmap a flat float32 blob as (rows, dim), proving the shape first.
+
+        The blob is headerless, so its geometry has to be inferred, and an
+        inferred shape that happens to divide evenly is not the same as a
+        correct one. Deriving dim as size/min_rows alone fails twice over:
+        the metadata's highest index is only a LOWER bound on the row count
+        (the plugin writes the two files separately, so the blob is often a
+        few rows ahead), and among the divisors that survive an exact-division
+        check several give a legal-looking dimension whose rows are windows
+        straddling two real vectors.
+
+        So the shape is verified rather than assumed, using the one property
+        the plugin guarantees: it stores unit vectors. Measured on the live
+        blob 2026-08-09 - of 59 dimensions that pass divisibility, exactly one
+        yields unit-norm rows (100% within 1%); the next best manages 8%. That
+        makes the norm a decisive test, not a heuristic.
+        """
         try:
             size = path.stat().st_size
         except OSError:
@@ -353,13 +384,34 @@ class SmartConnectionsDatabase:
         floats, rem = divmod(size, 4)
         if rem or floats == 0 or min_rows <= 0:
             return None
-        dim, rem = divmod(floats, min_rows)
-        # Row count comes from the metadata's highest index, so the division
-        # must be exact; anything else means the two disagree and guessing a
-        # dimension would silently misalign every row.
-        if rem or not (32 <= dim <= 8192):
-            return None
-        return np.memmap(path, dtype="<f4", mode="r", shape=(min_rows, dim))
+
+        # Widest rows first: that is the tightest fit to the row count the
+        # metadata claims, and the correct shape whenever the two agree.
+        candidates = sorted(
+            (d for d in range(32, min(8192, floats // min_rows) + 1)
+             if floats % d == 0),
+            reverse=True,
+        )
+        for dim in candidates:
+            rows = floats // dim
+            mat = np.memmap(path, dtype="<f4", mode="r", shape=(rows, dim))
+            step = max(1, rows // 64)
+            sample = np.asarray(mat[::step][:64], dtype=np.float32)
+            norms = np.linalg.norm(sample, axis=1)
+            nonzero = norms[norms > 0]
+            if nonzero.size and np.mean(np.abs(nonzero - 1.0) < 0.01) >= 0.9:
+                if rows != min_rows:
+                    print(f"note: {path.name} holds {rows} rows, metadata knew "
+                          f"of {min_rows} - reading {rows}x{dim}",
+                          file=sys.stderr)
+                return mat
+            del mat
+
+        print(f"WARNING: cannot determine the shape of {path.name} "
+              f"({size} bytes, at least {min_rows} rows expected) - no "
+              f"dimension yields unit vectors. Refusing to guess.",
+              file=sys.stderr)
+        return None
 
     def _read_modern_entries(self) -> Dict[str, dict]:
         """Parse smart_sources.ajson. Later lines win, as it is append-only."""
@@ -413,17 +465,64 @@ class SmartConnectionsDatabase:
                     f"or set SMART_CONNECTIONS_MODEL to an equivalent "
                     f"non-ONNX repo. Underlying error: {type(e).__name__}: {e}"
                 ) from e
+            self._verify_recorded_model()
+
+    def _verify_recorded_model(self):
+        """Re-check a cached model identification, once per process.
+
+        The identification is written once and then trusted forever, so a
+        single wrong answer would follow this blob for its whole life. It would
+        also be quiet: every model in play here is 384-dimensional, so the
+        dimension guard never fires, and the only symptom is a query prefix and
+        top-up encodes aimed at the wrong vector space.
+
+        The check is close to free because it runs after the model is loaded
+        for a query it was going to serve anyway - one encode of a note whose
+        stored vector is already in hand.
+        """
+        material = getattr(self, "_probe_material", None)
+        if not material or self._verified_model or os.getenv('SMART_CONNECTIONS_MODEL'):
+            return
+        self._verified_model = True
+        fp, text, stored = material
+        try:
+            doc_prefix = self._profile()['document_prefix']
+            v = np.asarray(self.model.encode(doc_prefix + text),
+                           dtype=np.float32).reshape(-1)
+        except Exception:
+            return
+        n = float(np.linalg.norm(v))
+        sn = float(np.linalg.norm(stored))
+        if not (np.isfinite(n) and np.isfinite(sn)) or n == 0.0 or sn == 0.0:
+            return
+        score = float((v / n) @ (stored / sn))
+        if score >= 0.7:
+            return
+        print(f"WARNING: '{self.model_name}' does not reproduce the vectors in "
+              f"store {fp} (probe cosine {score:+.3f}). The recorded "
+              f"identification is wrong, so results come from a mismatched "
+              f"vector space. Discarding it - delete "
+              f"{self._model_map_path()} and reconnect to re-identify, or set "
+              f"SMART_CONNECTIONS_MODEL.", file=sys.stderr)
+        mapping = self._model_map()
+        if mapping.pop(fp, None) is not None:
+            try:
+                with open(self._model_map_path(), "w", encoding="utf-8") as f:
+                    json.dump(mapping, f)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Vector store construction
     # ------------------------------------------------------------------
 
-    def _fingerprint(self) -> str:
-        """Cheap signature of the .ajson corpus.
+    def _store_signature(self) -> str:
+        """Stats of the files a matrix would be built from, model-independent.
 
-        Rebuilds the cache when Smart Connections re-embeds. Uses count,
-        newest mtime, and total size - enough to catch any real change
-        without hashing ~200MB on every boot.
+        Kept separate from the cache key so a caller can capture the store
+        state BEFORE a load and still key the result correctly afterwards -
+        the model name is only resolved during the load, and re-stating the
+        files at that point would describe a store that may have moved.
         """
         if self.modern_store:
             parts = []
@@ -435,8 +534,7 @@ class SmartConnectionsDatabase:
                 except OSError:
                     continue
                 parts.append(f"{p.name}:{st.st_size}:{st.st_mtime:.3f}")
-            raw = f"v{CACHE_VERSION}m:{'|'.join(parts)}:{self.model_name}"
-            return hashlib.sha256(raw.encode()).hexdigest()[:24]
+            return "m:" + "|".join(parts)
 
         count = 0
         newest = 0.0
@@ -454,7 +552,17 @@ class SmartConnectionsDatabase:
         # rewrite inside the same second that happens to preserve file count and
         # total size reuse a stale matrix. Unlikely, but a bulk re-embed writes
         # these files far faster than once a second.
-        raw = f"v{CACHE_VERSION}:{count}:{newest:.3f}:{total}:{self.model_name}"
+        return f"l:{count}:{newest:.3f}:{total}"
+
+    def _fingerprint(self, signature: Optional[str] = None) -> str:
+        """Cache key: what the store looked like, plus which model read it.
+
+        Rebuilds the cache when Smart Connections re-embeds, without hashing
+        hundreds of MB on every boot. Pass a signature captured earlier to key
+        a matrix to the state it was actually built from.
+        """
+        sig = self._store_signature() if signature is None else signature
+        raw = f"v{CACHE_VERSION}:{sig}:{self.model_name}"
         return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
     def _load_from_cache(self, fingerprint: str) -> bool:
@@ -538,7 +646,11 @@ class SmartConnectionsDatabase:
         entries = self._read_modern_entries()
         if not entries:
             return False
-        fp = self._active_fingerprint()
+        # Prefer the space the metadata says was embedded most recently. File
+        # mtime is only a pre-parse hint - a backup, a sync tool, or any
+        # process that touches an older blob would move it - and by this point
+        # the metadata has been parsed anyway, so the better signal is free.
+        fp = self._newest_fingerprint(entries) or self._active_fingerprint()
         if not fp:
             return False
 
@@ -604,6 +716,18 @@ class SmartConnectionsDatabase:
                         self.model_name = name
                         self._record_model(fp, name)
                         print(f"store {fp} identified as '{name}'", file=sys.stderr)
+            # Keep the material for a re-check. A recorded name is reused
+            # without question on every later start, so a single bad
+            # identification would stick for the life of the blob - and it
+            # would be quiet, because the models in play share a dimension and
+            # nothing downstream would notice a mismatched space.
+            for row, _key, path, _lines in src_refs:
+                text = self._read_note(path)
+                if len(text) > 400:
+                    self._probe_material = (fp, text,
+                                            np.asarray(src_mat[row],
+                                                       dtype=np.float32).copy())
+                    break
 
         vectors, keys, paths, lines = [], [], [], []
         skipped = 0
@@ -651,14 +775,35 @@ class SmartConnectionsDatabase:
         if self.embeddings_loaded:
             return
         if self.modern_store:
-            fingerprint = self._fingerprint()
-            if self._load_from_cache(fingerprint):
+            signature = self._store_signature()
+            if self._load_from_cache(self._fingerprint(signature)):
                 self._apply_topup()
                 return
-            if self._load_modern():
-                # The model may have been identified during the load, which
-                # changes the cache key - recompute before saving.
-                self._save_to_cache(self._fingerprint())
+            # Publish under the state that was actually READ, never the state on
+            # disk once the read finished. Obsidian writes these files while
+            # this runs, so re-stating afterwards keys a matrix built from
+            # state T0 to state T1 - which reads as a valid cache hit on the
+            # next start and silently serves a matrix that never held T1's rows.
+            #
+            # A moved store also means the read itself may be torn: the metadata
+            # is read whole, but the blobs are mmap'd and paged in during
+            # construction, so the two halves can straddle a rewrite. Retry
+            # once, and never cache a read the store moved under.
+            for attempt in (1, 2):
+                self.embed_at = {}
+                if not self._load_modern():
+                    break
+                after = self._store_signature()
+                if after == signature:
+                    self._save_to_cache(self._fingerprint(signature))
+                    self._apply_topup()
+                    return
+                signature = after
+                print("note: the store changed while it was being read - "
+                      + ("retrying." if attempt == 1
+                         else "using this read without caching it."),
+                      file=sys.stderr)
+            if self.embeddings_loaded:
                 self._apply_topup()
                 return
             print("WARNING: the 4.7.2 store could not be read; falling back to "
@@ -835,6 +980,13 @@ class SmartConnectionsDatabase:
         self.keys = [self.keys[i] for i in keep]
         self.paths = [self.paths[i] for i in keep]
         self.lines = [self.lines[i] for i in keep]
+        # Drop the embed time with the rows. Leaving it behind hides the note
+        # if it ever comes back with its old mtime - restored from a backup,
+        # copied with `cp -p`, checked out again - because the stale check asks
+        # whether the file is newer than its recorded embedding, and it is not.
+        # The note would then be in neither the matrix nor the stale set.
+        for p in gone:
+            self.embed_at.pop(p, None)
         self._finalize_masks()
         print(f"dropped {dropped} rows for {len(gone)} deleted note(s): "
               f"{', '.join(sorted(gone)[:3])}"
@@ -971,8 +1123,16 @@ class SmartConnectionsDatabase:
         second time. That costs nothing, and it avoids re-imposing the encoder
         truncation that per-heading chunking exists to escape - a whole-note
         encode of this file scored 0.533 at rank 21,796 for a question its own
-        text answers. Pooled unit vectors stay in the same space, so the row
-        remains comparable with Obsidian's own source rows.
+        text answers.
+
+        A pooled row is NOT interchangeable with the plugin's own source row,
+        and the matrix does mix the two constructions. Measured 2026-08-09 over
+        833 notes that have both: cosine 0.949, and only 0.43 Jaccard overlap
+        in the top 10 of find_related. So they rank differently - the question
+        is which ranks better. On 250 note-title queries, pooled scored MRR@10
+        0.664 against the plugin encode's 0.629, top-1 61.6% against 58.0%.
+        The divergence runs in favour of pooling, for the same reason chunking
+        beat whole-note embedding in the first place: no truncation.
         """
         if not chunks or any((c.get("heading") or "") == "" for c in chunks):
             return chunks
@@ -1047,6 +1207,7 @@ class SmartConnectionsDatabase:
         # whether work is still outstanding. Leaving a previous pass's value
         # standing after a no-op would report a backlog that no longer exists.
         self.topup_added = self.topup_superseded = self.topup_skipped = 0
+        self.topup_notes = 0
         if targets is None:
             targets = self._stale_or_missing()
         if not targets:
@@ -1190,6 +1351,7 @@ class SmartConnectionsDatabase:
         self.paths = [self.paths[i] for i in keep] + add_paths
         self.lines = [self.lines[i] for i in keep] + add_lines
         self.topup_added = len(add_keys)
+        self.topup_notes = len(done)
         self._finalize_masks()
         # Row indices in new_index are positions in add_rows, so the two are
         # written together and stay consistent by construction.
@@ -1399,7 +1561,11 @@ class SmartConnectionsDatabase:
             'cache_present': (self.cache_dir / 'vectors.npy').exists(),
             'topup': {
                 'enabled': TOPUP_ENABLED,
-                'notes_added': self.topup_added,
+                # Rows and notes are not the same number and never were: a note
+                # yields one row per heading chunk plus a synthesized note-level
+                # row, so a single two-heading note contributes three.
+                'rows_added': self.topup_added,
+                'notes_added': self.topup_notes,
                 'stale_rows_superseded': self.topup_superseded,
                 'deferred_over_cap': self.topup_skipped,
                 'note': ('Notes Obsidian has not embedded yet, re-chunked and indexed '
@@ -1626,7 +1792,8 @@ def reindex_cli() -> int:
     s = db.stats()
     t = s["topup"]
     print(f"vectors        : {s['vectors']}")
-    print(f"chunks added   : {t['notes_added']}")
+    print(f"notes covered  : {t['notes_added']}")
+    print(f"rows added     : {t['rows_added']}")
     print(f"stale dropped  : {t['stale_rows_superseded']}")
     print(f"deferred       : {t['deferred_over_cap']}")
     print(f"elapsed        : {time.time() - start:.1f}s")
