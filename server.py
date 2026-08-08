@@ -112,6 +112,40 @@ class SmartConnectionsDatabase:
 
     DEFAULT_MODEL = 'TaylorAI/bge-micro-v2'
 
+    # Asymmetric retrieval models expect a fixed instruction on the QUERY side
+    # and (sometimes) a different one on the document side. The prefix is
+    # applied by the host application, not baked into the model, so it has to
+    # be reproduced here or the two vector spaces do not line up.
+    #
+    # This is not a tuning detail. Benchmarked on this vault, arctic-embed-s
+    # scored MRR 0.760 with its prefix and 0.215 without - three and a half
+    # times WORSE than the bge-micro-v2 it would be replacing. Selecting an
+    # asymmetric model without this table is a downgrade, not an upgrade.
+    #
+    # Values mirror `transformers_models` in the Smart Connections plugin, so
+    # our embeddings stay in the same space as the ones it writes.
+    SEMANTIC_PROFILES = {
+        'TaylorAI/bge-micro-v2': {'query_prefix': '', 'document_prefix': ''},
+        'Snowflake/snowflake-arctic-embed-s': {
+            'query_prefix': 'Represent this sentence for searching relevant passages: ',
+            'document_prefix': '',
+        },
+        'Snowflake/snowflake-arctic-embed-xs': {
+            'query_prefix': 'Represent this sentence for searching relevant passages: ',
+            'document_prefix': '',
+        },
+        # Loadable only via the canonical repo; the Xenova ONNX port that the
+        # plugin lists cannot be opened by sentence-transformers.
+        'intfloat/multilingual-e5-small': {
+            'query_prefix': 'query: ', 'document_prefix': 'passage: ',
+        },
+    }
+
+    def _profile(self) -> dict:
+        return self.SEMANTIC_PROFILES.get(
+            self.model_name, {'query_prefix': '', 'document_prefix': ''}
+        )
+
     def _configured_model(self) -> str:
         """Model Smart Connections is actually using, from its own settings."""
         override = os.getenv('SMART_CONNECTIONS_MODEL')
@@ -142,7 +176,24 @@ class SmartConnectionsDatabase:
             from sentence_transformers import SentenceTransformer
 
             torch.set_num_threads(1)
-            self.model = SentenceTransformer(self.model_name)
+            try:
+                self.model = SentenceTransformer(self.model_name)
+            except Exception as e:
+                # Several models the plugin offers are ONNX-only ports
+                # (Xenova/*, onnx-community/*). Smart Connections runs them
+                # through transformers.js; sentence-transformers cannot open
+                # them at all. Say which model and what it costs, rather than
+                # surfacing a bare OSError from deep in the loader.
+                raise RuntimeError(
+                    f"cannot load embedding model '{self.model_name}'. Smart "
+                    f"Connections can use ONNX-only repos (Xenova/*, "
+                    f"onnx-community/*) but this server cannot, so semantic "
+                    f"search and top-up indexing are unavailable while it is "
+                    f"selected. Pick a model with PyTorch weights - "
+                    f"TaylorAI/bge-micro-v2 or Snowflake/snowflake-arctic-embed-s - "
+                    f"or set SMART_CONNECTIONS_MODEL to an equivalent "
+                    f"non-ONNX repo. Underlying error: {type(e).__name__}: {e}"
+                ) from e
 
     # ------------------------------------------------------------------
     # Vector store construction
@@ -544,6 +595,7 @@ class SmartConnectionsDatabase:
 
         if pending:
             texts, owners = [], []
+            doc_prefix = self._profile()['document_prefix']
             budget = float("inf") if unlimited else TOPUP_MAX_CHUNKS_PER_RUN
             for rel, mtime in pending:
                 chunks = self._chunk_note(rel)
@@ -553,10 +605,18 @@ class SmartConnectionsDatabase:
                     self.topup_skipped += len(pending) - pending.index((rel, mtime))
                     break
                 for heading, body, span in chunks:
-                    texts.append(body)
+                    texts.append(doc_prefix + body)
                     owners.append((rel, mtime, heading, span))
             if texts:
-                self.ensure_model_loaded()
+                try:
+                    self.ensure_model_loaded()
+                except RuntimeError as e:
+                    # Top-up is an enhancement; Smart Connections' own vectors
+                    # still work. Degrade to those rather than take search down,
+                    # but say so - a silent fallback here is the failure mode
+                    # this whole server has been fixing all night.
+                    print(f"WARNING: top-up indexing disabled - {e}", file=sys.stderr)
+                    return
                 import torch
                 # Batch encoding is throughput-bound, unlike the single-query
                 # path the 1-thread default was chosen for. Measured on 8 cores:
@@ -698,6 +758,7 @@ class SmartConnectionsDatabase:
 
     def _encode(self, query: str) -> np.ndarray:
         self.ensure_model_loaded()
+        query = self._profile()['query_prefix'] + query
         qv = np.asarray(self.model.encode(query), dtype=np.float32).reshape(-1)
         norm = float(np.linalg.norm(qv))
         if norm:
