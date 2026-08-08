@@ -42,13 +42,17 @@ DEFAULT_CACHE_DIR = Path(
 # vector wins and the top-up row is dropped.
 TOPUP_ENABLED = os.getenv("SMART_CONNECTIONS_TOPUP", "1") != "0"
 TOPUP_MAX_NOTES = int(os.getenv("SMART_CONNECTIONS_TOPUP_MAX", "400"))
-# Per-run chunk ceiling. The first query of a session pays this, so it is a
-# latency budget, not a correctness knob: ~21ms/chunk measured, so 600 chunks
-# is roughly 12s worst case and usually near zero, since only notes changed
-# since the last run need work. Targets are taken NEWEST FIRST, because the
-# notes an agent session needs are the ones just written. Clearing a large
-# backlog in one pass is what `--reindex` is for.
-TOPUP_MAX_CHUNKS_PER_RUN = int(os.getenv("SMART_CONNECTIONS_TOPUP_CHUNKS", "600"))
+# Per-run ceiling, expressed in SECONDS rather than chunks. The first query of
+# a session pays it, so what matters is wall clock, and encode speed varies by
+# almost 5x across the models Smart Connections offers - bge-micro-v2 runs
+# ~21ms/chunk, arctic-embed-s ~118ms. A fixed chunk count silently becomes a
+# 5x longer stall when the model changes; a time budget holds the latency
+# ceiling no matter which model is selected, with no knob to re-tune.
+#
+# Targets are taken NEWEST FIRST, because the notes an agent session needs are
+# the ones just written. Clearing a large backlog is what `--reindex` is for.
+TOPUP_TIME_BUDGET_SECONDS = float(os.getenv("SMART_CONNECTIONS_TOPUP_SECONDS", "12"))
+TOPUP_ENCODE_BATCH = int(os.getenv("SMART_CONNECTIONS_TOPUP_BATCH", "64"))
 TOPUP_ENCODE_THREADS = int(os.getenv("SMART_CONNECTIONS_TOPUP_THREADS", "4"))
 # How often a query may re-check the vault for edits. Indexing once at process
 # start is not enough: an agent session writes notes and then asks about them
@@ -594,20 +598,15 @@ class SmartConnectionsDatabase:
             pending = pending[:TOPUP_MAX_NOTES]
 
         if pending:
-            texts, owners = [], []
             doc_prefix = self._profile()['document_prefix']
-            budget = float("inf") if unlimited else TOPUP_MAX_CHUNKS_PER_RUN
+            groups = []
             for rel, mtime in pending:
                 chunks = self._chunk_note(rel)
-                if len(texts) + len(chunks) > budget:
-                    # Stop on a note boundary. A half-embedded note would be
-                    # cached as complete and never revisited.
-                    self.topup_skipped += len(pending) - pending.index((rel, mtime))
-                    break
-                for heading, body, span in chunks:
-                    texts.append(doc_prefix + body)
-                    owners.append((rel, mtime, heading, span))
-            if texts:
+                if chunks:
+                    groups.append((rel, mtime, chunks))
+
+            owners, vec_parts = [], []
+            if groups:
                 try:
                     self.ensure_model_loaded()
                 except RuntimeError as e:
@@ -622,13 +621,34 @@ class SmartConnectionsDatabase:
                 # path the 1-thread default was chosen for. Measured on 8 cores:
                 # 30.1ms/chunk at 1 thread, 20.8 at 4, 26.1 at 8.
                 torch.set_num_threads(max(1, TOPUP_ENCODE_THREADS))
+                deadline = None if unlimited else time.time() + TOPUP_TIME_BUDGET_SECONDS
+                i = 0
                 try:
-                    vecs = np.asarray(
-                        self.model.encode(texts, batch_size=32, show_progress_bar=False),
-                        dtype=np.float32,
-                    )
+                    while i < len(groups):
+                        if deadline is not None and time.time() > deadline:
+                            self.topup_skipped += len(groups) - i
+                            break
+                        # Fill a batch whole-notes-at-a-time. A note is never
+                        # split across the deadline, because a half-embedded
+                        # note would be cached as complete and never revisited.
+                        batch_texts, batch_owners = [], []
+                        while i < len(groups) and len(batch_texts) < TOPUP_ENCODE_BATCH:
+                            rel, mtime, chunks = groups[i]
+                            for heading, body, span in chunks:
+                                batch_texts.append(doc_prefix + body)
+                                batch_owners.append((rel, mtime, heading, span))
+                            i += 1
+                        vec_parts.append(np.asarray(
+                            self.model.encode(batch_texts, batch_size=32,
+                                              show_progress_bar=False),
+                            dtype=np.float32,
+                        ))
+                        owners.extend(batch_owners)
                 finally:
                     torch.set_num_threads(1)
+
+            if owners:
+                vecs = np.vstack(vec_parts)
                 for (rel, mtime, heading, span), vec in zip(owners, vecs):
                     v = np.asarray(vec, dtype=np.float32).reshape(-1)
                     n = float(np.linalg.norm(v))
