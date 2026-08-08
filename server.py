@@ -83,7 +83,16 @@ class SmartConnectionsDatabase:
     def __init__(self, vault_path: str):
         self.vault_path = Path(vault_path)
         self.smart_env_path = self.vault_path / ".smart-env"
+        # Two store layouts exist. `multi/` is the pre-4.7.2 one: one .ajson per
+        # note, vectors inline as JSON number lists. 4.7.2 migrated to a single
+        # metadata file plus flat float32 blobs, and STOPPED writing multi/ -
+        # it is left on disk, frozen, which is what makes reading the wrong one
+        # so quiet a failure. Verified 2026-08-09: multi/ last written
+        # 2026-08-08 19:51, minutes before the plugin bundle was replaced.
         self.multi_path = self.smart_env_path / "multi"
+        self.sources_dir = self.smart_env_path / "smart_sources"
+        self.blocks_dir = self.smart_env_path / "smart_blocks"
+        self.sources_ajson = self.sources_dir / "smart_sources.ajson"
 
         # Lazy load embedding model. The name is READ FROM Smart Connections'
         # own config rather than hardcoded: our top-up vectors have to live in
@@ -101,6 +110,16 @@ class SmartConnectionsDatabase:
         # cache fingerprint and the top-up cache both carry the model name).
         # Reconnect the server after switching. _refresh_if_stale re-reads the
         # setting on its throttle and says so rather than drifting silently.
+        # Resolved before the model, because the modern path identifies the
+        # model from a map kept in this directory. Assigning it after left
+        # _configured_model() reading an attribute that did not exist yet, so
+        # it silently fell back to the default and every process started under
+        # the wrong model name - which is also the cache key, so the base cache
+        # never hit and the store was re-parsed on every start.
+        cache_root = DEFAULT_CACHE_DIR
+        vault_id = hashlib.sha256(str(self.vault_path.resolve()).encode()).hexdigest()[:16]
+        self.cache_dir = cache_root / vault_id
+
         self.model = None
         self.model_name = self._configured_model()
 
@@ -128,10 +147,6 @@ class SmartConnectionsDatabase:
         self.topup_superseded = 0 # stale SC rows dropped in favour of a top-up
         self.topup_skipped = 0    # over TOPUP_MAX_NOTES this run
         self.rows_dropped = 0     # rows removed for notes deleted since load
-
-        cache_root = DEFAULT_CACHE_DIR
-        vault_id = hashlib.sha256(str(self.vault_path.resolve()).encode()).hexdigest()[:16]
-        self.cache_dir = cache_root / vault_id
 
     DEFAULT_MODEL = 'TaylorAI/bge-micro-v2'
 
@@ -170,10 +185,26 @@ class SmartConnectionsDatabase:
         )
 
     def _configured_model(self) -> str:
-        """Model Smart Connections is actually using, from its own settings."""
+        """Model Smart Connections is actually using.
+
+        Under the modern store this is NOT smart_env.json. That file's
+        `model_key` went stale on 4.7.2 - measured 2026-08-09, it still read
+        TaylorAI/bge-micro-v2 while every vector in the live store was
+        Snowflake/snowflake-arctic-embed-s. Trusting it there is worse than
+        having no switch at all: the wrong model means the wrong query prefix,
+        and arctic without its prefix scored MRR 0.215 against bge's 0.641 on
+        this vault. So the modern path takes the answer from what was actually
+        written to disk, identified once and cached.
+        """
         override = os.getenv('SMART_CONNECTIONS_MODEL')
         if override:
             return override
+        if self.modern_store:
+            known = self._model_map().get(self._active_fingerprint() or "")
+            if known:
+                return known
+            # Not identified yet - load_embeddings probes and records it.
+            return self.DEFAULT_MODEL
         try:
             with open(self.smart_env_path / 'smart_env.json', 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
@@ -184,6 +215,171 @@ class SmartConnectionsDatabase:
         except Exception:
             pass
         return self.DEFAULT_MODEL
+
+    # ------------------------------------------------------------------
+    # Modern store (Smart Connections 4.7.2+)
+    # ------------------------------------------------------------------
+
+    @property
+    def modern_store(self) -> bool:
+        return self.sources_ajson.exists()
+
+    def _active_fingerprint(self) -> Optional[str]:
+        """The embedding space currently being written, by blob recency.
+
+        Nothing on disk maps a blob to a model, and nothing marks one active -
+        the metadata carries several `mf_*` spaces side by side and the plugin
+        simply stops writing the old one. Newest mtime is the signal, and it is
+        cheap enough to re-check without parsing the 33MB metadata file.
+        """
+        try:
+            blobs = [p for p in self.sources_dir.glob("mf_*") if p.is_file()]
+        except OSError:
+            return None
+        if not blobs:
+            return None
+        return max(blobs, key=lambda p: p.stat().st_mtime).name
+
+    def _model_map_path(self) -> Path:
+        return self.cache_dir / "fingerprint-models.json"
+
+    def _model_map(self) -> Dict[str, str]:
+        try:
+            with open(self._model_map_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _record_model(self, fingerprint: str, model: str):
+        mapping = self._model_map()
+        if mapping.get(fingerprint) == model:
+            return
+        mapping[fingerprint] = model
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._model_map_path().with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(mapping, f)
+            tmp.replace(self._model_map_path())
+        except Exception:
+            pass
+
+    def _candidate_models(self) -> List[str]:
+        """Models worth probing, newest configured first.
+
+        Taken from the plugin's own registry rather than guessed, so the list
+        is what this vault has actually been set to at some point.
+        """
+        out, seen = [], set()
+        try:
+            with open(self.smart_env_path / "embedding_models" /
+                      "embedding_models.ajson", "r", encoding="utf-8") as f:
+                raw = f.read()
+            found = []
+            for line in raw.splitlines():
+                line = line.strip().rstrip(",")
+                if not line:
+                    continue
+                try:
+                    obj = json.loads("{" + line + "}")
+                except Exception:
+                    continue
+                for entry in obj.values():
+                    if isinstance(entry, dict) and entry.get("model_key"):
+                        found.append((entry.get("created_at") or 0,
+                                      entry["model_key"]))
+            for _, key in sorted(found, reverse=True):
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+        except Exception:
+            pass
+        for key in list(self.SEMANTIC_PROFILES) + [self.DEFAULT_MODEL]:
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+        return out
+
+    def _identify_model(self, probe_text: str, stored: np.ndarray) -> Optional[str]:
+        """Name the model that produced `stored`, by re-encoding `probe_text`.
+
+        The only reliable method available. A blob carries no model name, the
+        registry does not map fingerprints, and smart_env.json lies - so the
+        vector itself is the evidence. Right model lands around +0.96, wrong
+        one near zero, which is not a margin that needs a careful threshold.
+        """
+        target = np.asarray(stored, dtype=np.float32).reshape(-1)
+        n = float(np.linalg.norm(target))
+        if not np.isfinite(n) or n == 0.0:
+            return None
+        target = target / n
+
+        best, best_score = None, -2.0
+        for name in self._candidate_models():
+            try:
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer(name)
+                doc_prefix = self.SEMANTIC_PROFILES.get(name, {}).get(
+                    'document_prefix', '')
+                v = np.asarray(model.encode(doc_prefix + probe_text),
+                               dtype=np.float32).reshape(-1)
+            except Exception:
+                continue    # ONNX-only repo or missing weights - not a match
+            if v.shape[0] != target.shape[0]:
+                continue
+            vn = float(np.linalg.norm(v))
+            if not np.isfinite(vn) or vn == 0.0:
+                continue
+            score = float((v / vn) @ target)
+            if score > best_score:
+                best, best_score = name, score
+            if score > 0.9:
+                break       # unambiguous; do not load the rest
+        if best is None or best_score < 0.5:
+            print(f"WARNING: could not identify the embedding model for the "
+                  f"current store (best match {best} at {best_score:+.3f}). "
+                  f"Falling back to {self.DEFAULT_MODEL}; set "
+                  f"SMART_CONNECTIONS_MODEL to override.", file=sys.stderr)
+            return None
+        return best
+
+    def _open_blob(self, path: Path, min_rows: int) -> Optional[np.ndarray]:
+        """mmap a flat float32 blob as (rows, dim), deriving dim from its size."""
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        floats, rem = divmod(size, 4)
+        if rem or floats == 0 or min_rows <= 0:
+            return None
+        dim, rem = divmod(floats, min_rows)
+        # Row count comes from the metadata's highest index, so the division
+        # must be exact; anything else means the two disagree and guessing a
+        # dimension would silently misalign every row.
+        if rem or not (32 <= dim <= 8192):
+            return None
+        return np.memmap(path, dtype="<f4", mode="r", shape=(min_rows, dim))
+
+    def _read_modern_entries(self) -> Dict[str, dict]:
+        """Parse smart_sources.ajson. Later lines win, as it is append-only."""
+        entries: Dict[str, dict] = {}
+        try:
+            with open(self.sources_ajson, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip().rstrip(",")
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads("{" + line + "}")
+                    except Exception:
+                        continue
+                    for key, item in obj.items():
+                        if isinstance(item, dict):
+                            entries[key] = item
+        except OSError:
+            return {}
+        return entries
 
     def ensure_model_loaded(self):
         """Lazy load the embedding model on first use.
@@ -229,6 +425,19 @@ class SmartConnectionsDatabase:
         newest mtime, and total size - enough to catch any real change
         without hashing ~200MB on every boot.
         """
+        if self.modern_store:
+            parts = []
+            for p in [self.sources_ajson] + sorted(
+                    list(self.sources_dir.glob("mf_*")) +
+                    list(self.blocks_dir.glob("mf_*"))):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                parts.append(f"{p.name}:{st.st_size}:{st.st_mtime:.3f}")
+            raw = f"v{CACHE_VERSION}m:{'|'.join(parts)}:{self.model_name}"
+            return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
         count = 0
         newest = 0.0
         total = 0
@@ -318,6 +527,118 @@ class SmartConnectionsDatabase:
         self.path_set = {p for p in self.paths if p}
         self.embeddings_loaded = True
 
+    def _load_modern(self) -> bool:
+        """Build the matrix from the 4.7.2+ store. False if it is unusable.
+
+        Vectors are not in the metadata here - it holds `file` plus `file_i`,
+        an index into a flat float32 blob, so the matrix is assembled by
+        gathering rows rather than by decoding JSON numbers. That is also why
+        this is fast: no per-vector parsing at all.
+        """
+        entries = self._read_modern_entries()
+        if not entries:
+            return False
+        fp = self._active_fingerprint()
+        if not fp:
+            return False
+
+        def ref(obj):
+            emb = obj.get("embedding")
+            if not isinstance(emb, dict):
+                return None
+            slot = (emb.get("default") or {}).get(fp)
+            return slot if isinstance(slot, dict) else None
+
+        # Collect (row index, key, path, lines, embed time) before touching the
+        # blobs, so their row counts come from the metadata's own maxima.
+        src_refs, blk_refs = [], []
+        for key, item in entries.items():
+            path = item.get("path")
+            if not path or not key.startswith("smart_sources:"):
+                continue
+            slot = ref(item)
+            if slot and isinstance(slot.get("file_i"), int):
+                src_refs.append((slot["file_i"], f"smart_sources:{path}", path, None))
+                at = slot.get("at")
+                if isinstance(at, (int, float)):
+                    self.embed_at[path] = at / 1000.0
+            for bdata in (item.get("blocks_data") or {}).values():
+                if not isinstance(bdata, dict) or not bdata.get("should_embed"):
+                    continue
+                bslot = ref(bdata)
+                bkey = bdata.get("key")
+                if not bslot or not isinstance(bslot.get("file_i"), int) or not bkey:
+                    continue
+                blk_refs.append((bslot["file_i"], f"smart_blocks:{bkey}", path,
+                                 bdata.get("lines")))
+
+        if not src_refs:
+            return False
+        src_mat = self._open_blob(self.sources_dir / fp,
+                                  max(r[0] for r in src_refs) + 1)
+        blk_mat = (self._open_blob(self.blocks_dir / fp,
+                                   max(r[0] for r in blk_refs) + 1)
+                   if blk_refs else None)
+        if src_mat is None:
+            return False
+        if blk_mat is None:
+            blk_refs = []
+
+        # Identify the model from a real vector before anything is ranked. The
+        # query prefix depends on it, and a missing prefix costs more than the
+        # model upgrade gained.
+        if not os.getenv('SMART_CONNECTIONS_MODEL'):
+            known = self._model_map().get(fp)
+            if known:
+                self.model_name = known
+            else:
+                probe = None
+                for row, _key, path, _lines in src_refs:
+                    text = self._read_note(path)
+                    if len(text) > 400:
+                        probe = (row, text)
+                        break
+                if probe:
+                    name = self._identify_model(probe[1], src_mat[probe[0]])
+                    if name:
+                        self.model_name = name
+                        self._record_model(fp, name)
+                        print(f"store {fp} identified as '{name}'", file=sys.stderr)
+
+        vectors, keys, paths, lines = [], [], [], []
+        skipped = 0
+        for refs, mat in ((src_refs, src_mat), (blk_refs, blk_mat)):
+            for row, key, path, span in refs:
+                if row >= mat.shape[0]:
+                    skipped += 1
+                    continue
+                v = np.asarray(mat[row], dtype=np.float32)
+                n = float(np.linalg.norm(v))
+                if not np.isfinite(n) or n == 0.0:
+                    skipped += 1
+                    continue
+                vectors.append(v / n)
+                keys.append(key)
+                paths.append(path)
+                lines.append(span)
+
+        if not vectors:
+            return False
+        self.matrix = np.stack(vectors).astype(np.float32, copy=False)
+        self.keys = keys
+        self.paths = paths
+        self.lines = lines
+        self.skipped = skipped
+        self._finalize_masks()
+        return True
+
+    def _read_note(self, rel: str) -> str:
+        try:
+            return (self.vault_path / rel).read_text(encoding="utf-8",
+                                                     errors="ignore")
+        except OSError:
+            return ""
+
     def load_embeddings(self):
         """Build (or restore) the normalized vector matrix.
 
@@ -329,6 +650,20 @@ class SmartConnectionsDatabase:
         """
         if self.embeddings_loaded:
             return
+        if self.modern_store:
+            fingerprint = self._fingerprint()
+            if self._load_from_cache(fingerprint):
+                self._apply_topup()
+                return
+            if self._load_modern():
+                # The model may have been identified during the load, which
+                # changes the cache key - recompute before saving.
+                self._save_to_cache(self._fingerprint())
+                self._apply_topup()
+                return
+            print("WARNING: the 4.7.2 store could not be read; falling back to "
+                  "the legacy multi/ store, which that version stopped "
+                  "updating.", file=sys.stderr)
         if not self.multi_path.exists():
             self.matrix = np.zeros((0, 1), dtype=np.float32)
             self._finalize_masks()
