@@ -15,14 +15,22 @@ Instead of using text-based `Grep`, Claude Code can now perform **semantic searc
 ```
 Smart Connections Plugin
     ↓ (creates)
-.smart-env/multi/*.ajson
-    ↓ (reads)
-This MCP Server
-    ↓ (exposes via)
+.smart-env/smart_sources/smart_sources.ajson   metadata
+.smart-env/smart_sources/mf_<id>               float32 vectors
+.smart-env/smart_blocks/mf_<id>                float32 vectors
+    ↓ (reads, never writes)
+This MCP Server  ──  ~/.cache/smart-connections-mcp/   its own top-up vectors
+    ↓ (exposes via)                                    merged at query time
 MCP Protocol
     ↓ (consumed by)
 Claude Code
 ```
+
+Smart Connections 4.7.2 replaced the older `.smart-env/multi/*.ajson` layout
+(one file per note, vectors inline as JSON) with the tree above. The legacy
+path is still readable and still supported, but it warns when it is used - the
+plugin leaves the old tree in place on migration, so reading it silently
+succeeds against a corpus frozen at the migration date.
 
 ## Installation
 
@@ -177,27 +185,40 @@ get_context_blocks(query: "transformation through embodiment")
 ## Testing
 
 ```bash
-./run-tests.sh          # everything
+./run-tests.sh          # everything - 76 tests
 ./run-tests.sh units    # hermetic only - no vault, no model, no network
+./run-tests.sh paths    # hermetic, against a synthetic 4.7.2 store on disk
+./run-tests.sh live     # integration against the real vault and model
 ```
 
-Two suites, stdlib `unittest`, no test dependency to install.
+Three suites, stdlib `unittest`, no test dependency to install.
 
-- **`tests/test_server_units.py`** - 30 tests, ~0.03s. Synthetic blobs and
-  metadata; runs anywhere. Each case is a regression that actually happened and
-  says which one in its docstring.
-- **`tests/test_server_live.py`** - integration against a real vault and model.
+- **`tests/test_server_units.py`** - 40 tests, ~0.03s. Pure functions against
+  synthetic blobs and metadata; runs anywhere.
+- **`tests/test_server_paths.py`** - 17 tests, ~1s. Builds a miniature 4.7.2
+  store in a temp directory and drives `load_embeddings` end to end against it.
+  This module exists because the suite above it tested pure functions well and
+  call sites not at all - and every production-severity defect this project has
+  had was a call site.
+- **`tests/test_server_live.py`** - 19 tests against a real vault and model.
   Covers all four tools directly and again over the MCP protocol in a separate
-  process. Skipped automatically when no store is present, so the hermetic
-  suite still runs on a machine without Obsidian.
+  process.
+
+Each case is a regression that actually happened and names it in its docstring,
+so a failure says which bug came back. The standard for adding one: revert the
+fix it guards and confirm the test goes RED. A test that stays green with the
+fix removed was never checking the requirement it claims.
+
+**A missing store fails the live suite rather than skipping it.**
+`run-tests.sh` sets `SCMCP_REQUIRE_LIVE` whenever live tests were asked for.
+Green-because-nothing-ran is the exact lie told by the three `test_*.py`
+scripts this suite replaced - they pointed at absolute paths on the original
+author's machine, asserted nothing, and printed "All semantic search tests
+completed successfully" after finding zero results for every query. Set
+`SCMCP_ALLOW_NO_STORE=1` to opt out on a machine without Obsidian.
 
 Set `OBSIDIAN_VAULT_PATH` to test against a vault other than
 `~/obsidian/vault-obsidian`.
-
-The three `test_*.py` scripts this replaced pointed at absolute paths on the
-original author's machine, contained no assertions, and printed
-"All semantic search tests completed successfully" after finding zero results
-for every query.
 
 ## Tools Provided
 
@@ -246,9 +267,20 @@ Returns actual text content (not just paths) for RAG.
 
 ## Performance
 
-- **Initial load:** ~2-3 seconds (loads 3,249 embeddings)
-- **Query time:** ~100-200ms (cosine similarity across all embeddings)
-- **Memory:** ~50MB (cached embeddings)
+Measured on a 956-note vault indexed as 19,012 vectors (956 sources, 18,056
+blocks, 384 dims). Your numbers scale with vault size - `index_stats` reports
+the live ones rather than these.
+
+- **First load:** ~8s. Parses the 40MB metadata file, then loads the embedding
+  model to identify which one the store was built with.
+- **Later loads:** ~0.8s. The parsed matrix is cached under
+  `~/.cache/smart-connections-mcp/`, keyed to the store state it was read at.
+- **Query:** ~20ms median - one matmul against the normalized matrix.
+- **Memory:** ~29MB for the matrix itself, plus the model.
+
+The first query of a session may also spend up to `SMART_CONNECTIONS_TOPUP_SECONDS`
+(12s default) embedding notes the plugin has not reached yet. That budget is
+wall clock, not a chunk count, so it holds whichever model is selected.
 
 ## Troubleshooting
 
@@ -276,21 +308,33 @@ uv pip install "numpy<2.0.0" --force-reinstall
 ```
 
 #### No Results Returned
-- Check `.smart-env/multi/` has .ajson files
+- Check `.smart-env/smart_sources/` has `smart_sources.ajson` and an `mf_*`
+  blob beside it (or `.smart-env/multi/*.ajson` on a pre-4.7.2 plugin)
 - Verify Smart Connections is enabled in Obsidian
+- Run `index_stats` - it reports the live vector count and the identified model
 - Lower `min_similarity` threshold (try 0.2 instead of 0.3)
 
 #### Wrong Results
+- Run `index_stats` and check the reported model is the one selected in
+  Obsidian. **Do not trust `smart_env.json`'s `model_key`** - it goes stale
+  under 4.7.2 and can name a model the store was not built with. The server
+  ignores it and identifies the model from the vectors instead, by re-encoding
+  one note and matching against its stored vector.
+- An asymmetric model queried without its query prefix scores *worse* than the
+  model it replaced, and the failure looks like "that model is bad" rather than
+  "a string is missing". Prefixes are keyed by model name in `SEMANTIC_PROFILES`.
 - Smart Connections may need to re-index
-- Check embedding model matches (BGE-micro-v2)
-- Restart server to reload embeddings
+- Reconnect the MCP server (`/mcp` in Claude Code) to reload after a model change
 
 ## Development
 
 **Update embeddings:**
-- Smart Connections auto-updates `.smart-env/`
-- MCP server reads on startup (restart to refresh)
-- Future: Add file watcher for auto-reload
+- Smart Connections auto-updates `.smart-env/` while Obsidian is open
+- The server picks up notes written since, without a restart: search entry
+  points re-check the vault for stale and deleted notes, throttled to once per
+  5s and guarded by a signature so an unchanged vault costs ~0.4us
+- `--reindex` drains a whole backlog in one pass, ignoring the time budget
+- A reconnect is still needed after a **model** change, which rebuilds both caches
 
 **Add new tools:**
 Edit `handle_request()` in `server.py`
