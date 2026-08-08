@@ -76,6 +76,15 @@ TOPUP_MIN_CHARS = 50     # below this a chunk carries no retrievable signal
 TOPUP_MAX_CHUNKS = 80    # per note, so one huge daily log cannot dominate a run
 TOPUP_SKIP_DIRS = {".git", ".obsidian", ".smart-env", ".trash"}
 
+# Floor for accepting that a model reproduces a store's vectors. The probe
+# re-encodes a note's CURRENT text against the vector stored for it, so the
+# three cases have to stay separated by this one number. Measured on this
+# vault: right model and unchanged text 0.980; right model but the note has
+# since been rewritten 0.631; wrong model -0.076. A 0.7 floor sat above the
+# drift case and would reject a correct identification whenever the probe note
+# had been edited. The gap that matters is model-vs-model, and it is enormous.
+MODEL_PROBE_MIN_COSINE = float(os.getenv("SMART_CONNECTIONS_PROBE_FLOOR", "0.35"))
+
 
 class SmartConnectionsDatabase:
     """Interface to Smart Connections .smart-env vector database"""
@@ -147,6 +156,7 @@ class SmartConnectionsDatabase:
         self.topup_superseded = 0 # stale SC rows dropped in favour of a top-up
         self.topup_skipped = 0    # over TOPUP_MAX_NOTES this run
         self.rows_dropped = 0     # rows removed for notes deleted since load
+        self.active_space = None  # mf_* fingerprint the matrix was built from
         self.topup_notes = 0      # DISTINCT notes covered, as opposed to rows
         self._probe_material = None   # (fingerprint, note text, stored vector)
         self._verified_model = False
@@ -243,15 +253,24 @@ class SmartConnectionsDatabase:
             return None
         return max(blobs, key=lambda p: p.stat().st_mtime).name
 
-    @staticmethod
-    def _newest_fingerprint(entries: Dict[str, dict]) -> Optional[str]:
-        """The embedding space with the most recent `at`, across all sources."""
+    def _newest_fingerprint(self, entries: Dict[str, dict]) -> Optional[str]:
+        """The embedding space with the most recent credible `at`.
+
+        A plain argmax over 33MB of metadata is one corrupt timestamp away from
+        selecting another space entirely, or one that has no blob at all - and
+        the whole load then fails. So a timestamp in the future is ignored, and
+        the winner has to exist on disk. Ties and gaps fall back to the caller's
+        mtime hint.
+        """
+        horizon = (time.time() + 86400) * 1000.0     # `at` is epoch millis
         best, best_at = None, -1.0
         for item in entries.values():
             slots = ((item.get("embedding") or {}).get("default") or {})
             for name, slot in slots.items():
                 at = slot.get("at") if isinstance(slot, dict) else None
-                if isinstance(at, (int, float)) and at > best_at:
+                if not isinstance(at, (int, float)) or at > horizon:
+                    continue
+                if at > best_at and (self.sources_dir / name).exists():
                     best, best_at = name, float(at)
         return best
 
@@ -480,30 +499,33 @@ class SmartConnectionsDatabase:
         for a query it was going to serve anyway - one encode of a note whose
         stored vector is already in hand.
         """
-        material = getattr(self, "_probe_material", None)
+        material = self._probe_material
         if not material or self._verified_model or os.getenv('SMART_CONNECTIONS_MODEL'):
             return
-        self._verified_model = True
         fp, text, stored = material
         try:
             doc_prefix = self._profile()['document_prefix']
             v = np.asarray(self.model.encode(doc_prefix + text),
                            dtype=np.float32).reshape(-1)
-        except Exception:
+        except Exception as e:
+            # Do NOT mark this verified. Setting the flag before the check
+            # could complete turned a transient encode failure into a
+            # permanent skip of the safety net.
+            print(f"note: could not verify the embedding model this pass "
+                  f"({type(e).__name__}); will retry.", file=sys.stderr)
             return
         n = float(np.linalg.norm(v))
         sn = float(np.linalg.norm(stored))
         if not (np.isfinite(n) and np.isfinite(sn)) or n == 0.0 or sn == 0.0:
             return
         score = float((v / n) @ (stored / sn))
-        if score >= 0.7:
+        self._verified_model = True     # a real score: this pass decided
+        if score >= MODEL_PROBE_MIN_COSINE:
             return
+
         print(f"WARNING: '{self.model_name}' does not reproduce the vectors in "
-              f"store {fp} (probe cosine {score:+.3f}). The recorded "
-              f"identification is wrong, so results come from a mismatched "
-              f"vector space. Discarding it - delete "
-              f"{self._model_map_path()} and reconnect to re-identify, or set "
-              f"SMART_CONNECTIONS_MODEL.", file=sys.stderr)
+              f"store {fp} (probe cosine {score:+.3f}). Re-identifying.",
+              file=sys.stderr)
         mapping = self._model_map()
         if mapping.pop(fp, None) is not None:
             try:
@@ -511,6 +533,28 @@ class SmartConnectionsDatabase:
                     json.dump(mapping, f)
             except Exception:
                 pass
+
+        # Fixing the map file alone would leave THIS process querying and
+        # topping up in the wrong space until someone reconnected it - as wrong
+        # as before the check, but with a warning. Re-identify and switch now.
+        name = self._identify_model(text, stored)
+        if name and name != self.model_name:
+            from sentence_transformers import SentenceTransformer
+            try:
+                self.model = SentenceTransformer(name)
+            except Exception as e:
+                print(f"WARNING: cannot load '{name}' ({type(e).__name__}). "
+                      f"Search is answering from a mismatched vector space - "
+                      f"reconnect, or set SMART_CONNECTIONS_MODEL.",
+                      file=sys.stderr)
+                return
+            self.model_name = name
+            self._record_model(fp, name)
+            print(f"store {fp} re-identified as '{name}'", file=sys.stderr)
+        elif not name:
+            print(f"WARNING: no available model reproduces store {fp}. Search "
+                  f"is answering from a mismatched vector space - reconnect, "
+                  f"or set SMART_CONNECTIONS_MODEL.", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Vector store construction
@@ -589,6 +633,7 @@ class SmartConnectionsDatabase:
         self.lines = meta["lines"]
         self.skipped = meta.get("skipped", 0)
         self.embed_at = meta.get("embed_at", {})
+        self.active_space = meta.get("space") or self.active_space
         self._finalize_masks()
         return True
 
@@ -608,6 +653,7 @@ class SmartConnectionsDatabase:
                         "model": self.model_name,
                         "built_at": time.time(),
                         "skipped": self.skipped,
+                        "space": self.active_space,
                         "keys": self.keys,
                         "paths": self.paths,
                         "lines": self.lines,
@@ -642,6 +688,15 @@ class SmartConnectionsDatabase:
         an index into a flat float32 blob, so the matrix is assembled by
         gathering rows rather than by decoding JSON numbers. That is also why
         this is fast: no per-vector parsing at all.
+
+        Nothing is written to instance state until the whole build succeeds.
+        This used to populate `self.embed_at` while collecting refs, which
+        meant a failed call left the previous load's matrix paired with a
+        half-written map of embed times - and the caller, seeing a matrix,
+        carried on. Every note then looked unembedded, so the first query spent
+        the entire top-up budget re-encoding a vault that was already indexed.
+        Publishing atomically removes the whole class rather than one path
+        through it.
         """
         entries = self._read_modern_entries()
         if not entries:
@@ -664,6 +719,7 @@ class SmartConnectionsDatabase:
         # Collect (row index, key, path, lines, embed time) before touching the
         # blobs, so their row counts come from the metadata's own maxima.
         src_refs, blk_refs = [], []
+        embed_at: Dict[str, float] = {}
         for key, item in entries.items():
             path = item.get("path")
             if not path or not key.startswith("smart_sources:"):
@@ -673,7 +729,7 @@ class SmartConnectionsDatabase:
                 src_refs.append((slot["file_i"], f"smart_sources:{path}", path, None))
                 at = slot.get("at")
                 if isinstance(at, (int, float)):
-                    self.embed_at[path] = at / 1000.0
+                    embed_at[path] = at / 1000.0
             for bdata in (item.get("blocks_data") or {}).values():
                 if not isinstance(bdata, dict) or not bdata.get("should_embed"):
                     continue
@@ -699,35 +755,32 @@ class SmartConnectionsDatabase:
         # Identify the model from a real vector before anything is ranked. The
         # query prefix depends on it, and a missing prefix costs more than the
         # model upgrade gained.
+        model_name = self.model_name
+        probe_material = None
         if not os.getenv('SMART_CONNECTIONS_MODEL'):
-            known = self._model_map().get(fp)
-            if known:
-                self.model_name = known
-            else:
-                probe = None
-                for row, _key, path, _lines in src_refs:
-                    text = self._read_note(path)
-                    if len(text) > 400:
-                        probe = (row, text)
-                        break
-                if probe:
-                    name = self._identify_model(probe[1], src_mat[probe[0]])
-                    if name:
-                        self.model_name = name
-                        self._record_model(fp, name)
-                        print(f"store {fp} identified as '{name}'", file=sys.stderr)
-            # Keep the material for a re-check. A recorded name is reused
-            # without question on every later start, so a single bad
-            # identification would stick for the life of the blob - and it
-            # would be quiet, because the models in play share a dimension and
-            # nothing downstream would notice a mismatched space.
+            probe = None
             for row, _key, path, _lines in src_refs:
                 text = self._read_note(path)
                 if len(text) > 400:
-                    self._probe_material = (fp, text,
-                                            np.asarray(src_mat[row],
-                                                       dtype=np.float32).copy())
+                    probe = (row, text)
                     break
+            if probe:
+                # Kept for a re-check. A recorded name is reused without
+                # question on every later start, so one bad identification
+                # would follow the blob for its life - quietly, because the
+                # models in play share a dimension.
+                probe_material = (fp, probe[1],
+                                  np.asarray(src_mat[probe[0]],
+                                             dtype=np.float32).copy())
+            known = self._model_map().get(fp)
+            if known:
+                model_name = known
+            elif probe:
+                name = self._identify_model(probe[1], src_mat[probe[0]])
+                if name:
+                    model_name = name
+                    self._record_model(fp, name)
+                    print(f"store {fp} identified as '{name}'", file=sys.stderr)
 
         vectors, keys, paths, lines = [], [], [], []
         skipped = 0
@@ -748,13 +801,40 @@ class SmartConnectionsDatabase:
 
         if not vectors:
             return False
+        # Single publish point. Everything above this line is local, so a
+        # `return False` anywhere leaves the previous state exactly as it was.
         self.matrix = np.stack(vectors).astype(np.float32, copy=False)
         self.keys = keys
         self.paths = paths
         self.lines = lines
         self.skipped = skipped
+        self.embed_at = embed_at
+        self.model_name = model_name
+        self.active_space = fp
+        self._probe_material = probe_material
         self._finalize_masks()
         return True
+
+    def _arm_model_probe(self):
+        """Pick a note whose stored vector can re-check the recorded model.
+
+        Used after a cache hit, where no identification happened and there is
+        therefore nothing else to catch a wrong recorded name.
+        """
+        if self._probe_material is not None or not self.active_space:
+            return
+        if self.matrix is None or self.is_source is None:
+            return
+        for row in np.flatnonzero(self.is_source)[:200]:
+            path = self.paths[row]
+            if not path:
+                continue
+            text = self._read_note(path)
+            if len(text) > 400:
+                self._probe_material = (
+                    self.active_space, text,
+                    np.asarray(self.matrix[row], dtype=np.float32).copy())
+                return
 
     def _read_note(self, rel: str) -> str:
         try:
@@ -777,6 +857,11 @@ class SmartConnectionsDatabase:
         if self.modern_store:
             signature = self._store_signature()
             if self._load_from_cache(self._fingerprint(signature)):
+                # Arm the model re-check here too. It was only armed by a cold
+                # rebuild, which is the one path that had just identified the
+                # model anyway - so the safety net was dead for the lifetime of
+                # any process that started from cache, which is most of them.
+                self._arm_model_probe()
                 self._apply_topup()
                 return
             # Publish under the state that was actually READ, never the state on
@@ -790,7 +875,10 @@ class SmartConnectionsDatabase:
             # construction, so the two halves can straddle a rewrite. Retry
             # once, and never cache a read the store moved under.
             for attempt in (1, 2):
-                self.embed_at = {}
+                # No state is cleared between attempts. _load_modern publishes
+                # atomically, so a failed retry leaves the first attempt's
+                # matrix AND its embed times intact rather than pairing one
+                # with the other's absence.
                 if not self._load_modern():
                     break
                 after = self._store_signature()

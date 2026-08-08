@@ -192,7 +192,14 @@ class ModernMetadata(unittest.TestCase):
         self.assertEqual(entries["smart_sources:a.md"]["v"], 2)
         self.assertIn("smart_sources:b.md", entries)
 
+    def _with_blobs(self, *names):
+        self.db.sources_dir = self.tmp / "smart_sources"
+        self.db.sources_dir.mkdir(exist_ok=True)
+        for n in names:
+            write_blob(self.db.sources_dir / n, unit_rows(2))
+
     def test_newest_fingerprint_wins_on_timestamp_not_order(self):
+        self._with_blobs("mf_old", "mf_new")
         entries = {
             "a": {"embedding": {"default": {"mf_old": {"at": 100},
                                             "mf_new": {"at": 900}}}},
@@ -200,10 +207,25 @@ class ModernMetadata(unittest.TestCase):
             "c": {"embedding": None},
             "d": {},
         }
-        self.assertEqual(DB._newest_fingerprint(entries), "mf_new")
+        self.assertEqual(self.db._newest_fingerprint(entries), "mf_new")
+
+    def test_a_future_timestamp_cannot_hijack_the_selection(self):
+        # One corrupt or clock-skewed `at` in 33MB of metadata used to flip the
+        # whole load to another space - or to one with no blob, failing the load.
+        self._with_blobs("mf_old", "mf_new")
+        entries = {"a": {"embedding": {"default": {
+            "mf_old": {"at": 1e15}, "mf_new": {"at": 1e12}}}}}
+        self.assertEqual(self.db._newest_fingerprint(entries), "mf_new")
+
+    def test_a_space_with_no_blob_on_disk_is_not_selected(self):
+        self._with_blobs("mf_present")
+        entries = {"a": {"embedding": {"default": {
+            "mf_present": {"at": 100}, "mf_absent": {"at": 900}}}}}
+        self.assertEqual(self.db._newest_fingerprint(entries), "mf_present")
 
     def test_newest_fingerprint_is_none_when_nothing_is_embedded(self):
-        self.assertIsNone(DB._newest_fingerprint({"a": {"embedding": {"default": {}}}}))
+        self._with_blobs()
+        self.assertIsNone(self.db._newest_fingerprint({"a": {"embedding": {"default": {}}}}))
 
 
 class CacheKeying(unittest.TestCase):
@@ -370,6 +392,116 @@ class DeferredTopupRetry(unittest.TestCase):
         self.db._last_check = 0.0
         self.db._refresh_if_stale()
         self.assertEqual(len(self.calls), 2)
+
+
+class AtomicPublish(unittest.TestCase):
+    """A failed load must leave the previous state exactly as it was.
+
+    _load_modern used to populate embed_at while collecting refs. A retry that
+    failed then left the first attempt's matrix paired with a half-written map
+    of embed times - and the caller, seeing a matrix, carried on. Every note
+    looked unembedded, so the first query spent the whole top-up budget
+    re-encoding an already-indexed vault.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scmcp-atomic-"))
+        self.db = bare_db(self.tmp)
+        self.db.matrix = unit_rows(2)
+        self.db.keys = ["smart_sources:a.md", "smart_sources:b.md"]
+        self.db.paths = ["a.md", "b.md"]
+        self.db.lines = [None, None]
+        self.db.embed_at = {"a.md": 10.0, "b.md": 20.0}
+        self.db.model_name = "kept/model"
+        self.db._finalize_masks()
+
+    def test_a_failed_load_touches_nothing(self):
+        self.db.sources_ajson = self.tmp / "missing.ajson"     # forces False
+        self.assertFalse(self.db._load_modern())
+        self.assertEqual(self.db.embed_at, {"a.md": 10.0, "b.md": 20.0})
+        self.assertEqual(self.db.matrix.shape[0], 2)
+        self.assertEqual(self.db.model_name, "kept/model")
+
+    def test_a_failed_load_after_metadata_parses_still_touches_nothing(self):
+        # Gets past _read_modern_entries, then finds no usable refs.
+        p = self.tmp / "smart_sources.ajson"
+        p.write_text('"smart_sources:x.md": {"path":"x.md"},\n', encoding="utf-8")
+        self.db.sources_ajson = p
+        self.assertFalse(self.db._load_modern())
+        self.assertEqual(self.db.embed_at, {"a.md": 10.0, "b.md": 20.0})
+        self.assertEqual(self.db.paths, ["a.md", "b.md"])
+
+
+class ModelReverification(unittest.TestCase):
+    """The re-check must arm on the warm path and survive a transient error.
+
+    It was only armed by a cold rebuild - the one path that had just identified
+    the model anyway - so the safety net was dead for any process starting from
+    cache, which is most of them.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scmcp-verify-"))
+        (self.tmp / "note.md").write_text("# n\n\n" + "body text. " * 60,
+                                          encoding="utf-8")
+        self.db = DB(str(self.tmp))
+        self.db.cache_dir = self.tmp / "cache"
+        self.db.matrix = unit_rows(1)
+        self.db.keys = ["smart_sources:note.md"]
+        self.db.paths = ["note.md"]
+        self.db.lines = [None]
+        self.db._finalize_masks()
+
+    def test_probe_is_armed_from_loaded_state(self):
+        self.db.active_space = "mf_x"
+        self.db._arm_model_probe()
+        self.assertIsNotNone(self.db._probe_material)
+        self.assertEqual(self.db._probe_material[0], "mf_x")
+
+    def test_no_probe_without_a_known_space(self):
+        self.db.active_space = None
+        self.db._arm_model_probe()
+        self.assertIsNone(self.db._probe_material)
+
+    def test_an_encode_failure_does_not_permanently_skip_the_check(self):
+        # The flag used to be set before the check could complete, turning a
+        # transient error into a permanent skip of the safety net.
+        class Boom:
+            def encode(self, *a, **k):
+                raise RuntimeError("no")
+        self.db._probe_material = ("mf_x", "text", unit_rows(1)[0])
+        self.db.model = Boom()
+        self.db._verify_recorded_model()
+        self.assertFalse(self.db._verified_model, "must be retried, not skipped")
+
+    def test_a_matching_model_marks_the_check_done(self):
+        vec = unit_rows(1, seed=9)[0]
+        class Same:
+            def encode(self, *a, **k):
+                return vec
+        self.db._probe_material = ("mf_x", "text", vec)
+        self.db.model = Same()
+        self.db.model_name = "right/model"
+        self.db._verify_recorded_model()
+        self.assertTrue(self.db._verified_model)
+        self.assertEqual(self.db.model_name, "right/model")
+
+    def test_content_drift_is_not_treated_as_a_wrong_model(self):
+        # Right model, note rewritten since it was embedded, measured at 0.631.
+        # A 0.7 floor rejected that; the model-vs-model gap is what matters.
+        a = unit_rows(1, seed=11)[0]
+        b = unit_rows(1, seed=12)[0]
+        drifted = a * 0.65 + b * float(np.sqrt(1 - 0.65 ** 2))
+        drifted = drifted / np.linalg.norm(drifted)
+        class Drifted:
+            def encode(self, *x, **k):
+                return drifted
+        self.db._probe_material = ("mf_x", "text", a)
+        self.db.model = Drifted()
+        self.db.model_name = "right/model"
+        self.db._verify_recorded_model()
+        self.assertEqual(self.db.model_name, "right/model",
+                         "an edited probe note must not unseat a correct model")
 
 
 class Counters(unittest.TestCase):
