@@ -114,6 +114,7 @@ class SmartConnectionsDatabase:
         self.is_source: Optional[np.ndarray] = None  # bool mask
         self.is_block: Optional[np.ndarray] = None   # bool mask
         self.key_index: Dict[str, int] = {}
+        self.path_set: set = set()   # distinct note paths currently in the matrix
         self.skipped = 0
         self.embeddings_loaded = False
         # vault-relative path -> epoch seconds Smart Connections last embedded it
@@ -126,6 +127,7 @@ class SmartConnectionsDatabase:
         self.topup_added = 0      # notes embedded here because SC was behind
         self.topup_superseded = 0 # stale SC rows dropped in favour of a top-up
         self.topup_skipped = 0    # over TOPUP_MAX_NOTES this run
+        self.rows_dropped = 0     # rows removed for notes deleted since load
 
         cache_root = DEFAULT_CACHE_DIR
         vault_id = hashlib.sha256(str(self.vault_path.resolve()).encode()).hexdigest()[:16]
@@ -311,6 +313,9 @@ class SmartConnectionsDatabase:
             (k.startswith("smart_blocks:") for k in keys), dtype=bool, count=len(keys)
         )
         self.key_index = {k: i for i, k in enumerate(keys)}
+        # Distinct paths, for deletion detection. ~30k rows collapse to under
+        # 1k paths, and this is the only place the row list changes.
+        self.path_set = {p for p in self.paths if p}
         self.embeddings_loaded = True
 
     def load_embeddings(self):
@@ -419,14 +424,24 @@ class SmartConnectionsDatabase:
     # ------------------------------------------------------------------
 
     def _stale_or_missing(self) -> List[tuple]:
-        """(path, mtime) for notes whose content is newer than SC's vector.
+        """(path, mtime) for notes whose content is newer than SC's vector."""
+        return self._scan_vault()[0]
+
+    def _scan_vault(self) -> tuple:
+        """(stale, present) - stale as (path, mtime), present as every .md path.
 
         Runs on a throttle before every search, so it is on the latency path.
         os.scandir is used rather than rglob + .stat(): DirEntry carries the
         stat result from the directory read itself, halving the syscalls -
         measured 28ms to 13ms across 955 files.
+
+        The full path set falls out of the same walk. Deletion handling was
+        previously deferred as needing a second walk over the vault; it does
+        not. This walk already visits every note and simply discarded the ones
+        that were not stale.
         """
         out = []
+        present = set()
         stack = [(str(self.vault_path), "")]
         while stack:
             abs_dir, rel_dir = stack.pop()
@@ -447,11 +462,49 @@ class SmartConnectionsDatabase:
                     mtime = entry.stat(follow_symlinks=False).st_mtime
                 except OSError:
                     continue
+                present.add(rel)
                 embedded = self.embed_at.get(rel)
                 # 2s slack absorbs filesystem/clock granularity between the two.
                 if embedded is None or mtime > embedded + 2:
                     out.append((rel, mtime))
-        return out
+        return out, present
+
+    def _drop_deleted(self, present: set) -> int:
+        """Remove rows for notes that no longer exist. Returns rows dropped.
+
+        A deleted note kept its vectors until the process restarted, so it went
+        on being returned by search - with `_read_text` supplying "" for the
+        missing file, which reads as a result with no content rather than as an
+        error. Short-lived subprocesses hid this; a long-running server and the
+        vault-tools daemon do not.
+
+        Cheap because it compares path sets, not rows: the matrix has ~30k rows
+        but under 1k distinct paths, and the set is rebuilt only when the matrix
+        changes.
+        """
+        if not self.path_set:
+            return 0
+        candidates = self.path_set - present
+        if not candidates:
+            return 0
+        # Confirm before dropping. The walk skips a few directories and counts
+        # only `.md`, so "not seen by the walk" is not "not on disk" - and the
+        # cost of being wrong here is deleting live vectors.
+        gone = {p for p in candidates if not (self.vault_path / p).exists()}
+        if not gone:
+            return 0
+
+        keep = [i for i, p in enumerate(self.paths) if p not in gone]
+        dropped = len(self.paths) - len(keep)
+        self.matrix = np.asarray(self.matrix)[keep]
+        self.keys = [self.keys[i] for i in keep]
+        self.paths = [self.paths[i] for i in keep]
+        self.lines = [self.lines[i] for i in keep]
+        self._finalize_masks()
+        print(f"dropped {dropped} rows for {len(gone)} deleted note(s): "
+              f"{', '.join(sorted(gone)[:3])}"
+              f"{' ...' if len(gone) > 3 else ''}", file=sys.stderr)
+        return dropped
 
     def _refresh_if_stale(self):
         """Pick up vault edits made since this process started.
@@ -475,7 +528,14 @@ class SmartConnectionsDatabase:
                   f"come from the old space - reconnect the server.",
                   file=sys.stderr)
 
-        targets = self._stale_or_missing()
+        targets, present = self._scan_vault()
+
+        # Ahead of the signature guard, deliberately. The signature covers the
+        # STALE set, and deleting a note Obsidian had already embedded does not
+        # change it - so behind the guard this would return early and the
+        # deleted note would keep answering queries until the process restarted.
+        self.rows_dropped += self._drop_deleted(present)
+
         signature = hashlib.sha256(
             "|".join(f"{r}:{m:.3f}" for r, m in sorted(targets)).encode()
         ).hexdigest()
@@ -999,6 +1059,7 @@ class SmartConnectionsDatabase:
             'sources': int(self.is_source.sum()) if self.is_source is not None else 0,
             'blocks': int(self.is_block.sum()) if self.is_block is not None else 0,
             'skipped_unembedded': self.skipped,
+            'rows_dropped_deleted': self.rows_dropped,
             'cache_dir': str(self.cache_dir),
             'cache_present': (self.cache_dir / 'vectors.npy').exists(),
             'topup': {
