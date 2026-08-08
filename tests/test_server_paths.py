@@ -113,10 +113,11 @@ class CacheKeyIsPinnedToTheReadStore(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="scmcp-toctou-"))
         self.vault, self.fp = make_store(self.tmp)
         self.cache = self.tmp / "cache"
+        self._topup = server.TOPUP_ENABLED
         server.TOPUP_ENABLED = False
 
     def tearDown(self):
-        server.TOPUP_ENABLED = True
+        server.TOPUP_ENABLED = self._topup
 
     def test_a_quiet_store_is_cached_under_the_signature_it_was_read_at(self):
         db = db_for(self.vault, self.cache, self.fp)
@@ -184,11 +185,12 @@ class WarmStartArmsTheModelCheck(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="scmcp-warm-"))
         self.vault, self.fp = make_store(self.tmp)
         self.cache = self.tmp / "cache"
+        self._topup = server.TOPUP_ENABLED
         server.TOPUP_ENABLED = False
         db_for(self.vault, self.cache, self.fp).load_embeddings()   # warm it
 
     def tearDown(self):
-        server.TOPUP_ENABLED = True
+        server.TOPUP_ENABLED = self._topup
 
     def test_a_cache_hit_arms_the_probe(self):
         db = db_for(self.vault, self.cache, self.fp)
@@ -254,10 +256,12 @@ class TopupCountersAndSupersede(unittest.TestCase):
         self.db.model = FakeEncoder()
         self.db.ensure_model_loaded = lambda: None
         server.TOPUP_ENABLED = True
+        self._budget = server.TOPUP_TIME_BUDGET_SECONDS
         server.TOPUP_TIME_BUDGET_SECONDS = 60
 
     def tearDown(self):
         server.TOPUP_ENABLED = self._topup
+        server.TOPUP_TIME_BUDGET_SECONDS = self._budget
 
     def test_notes_and_rows_are_counted_as_different_things(self):
         rel = "note0.md"
@@ -303,10 +307,12 @@ class LoudFailures(unittest.TestCase):
         self.db.model = FakeEncoder()
         self.db.ensure_model_loaded = lambda: None
         server.TOPUP_ENABLED = True
+        self._budget = server.TOPUP_TIME_BUDGET_SECONDS
         server.TOPUP_TIME_BUDGET_SECONDS = 60
 
     def tearDown(self):
         server.TOPUP_ENABLED = self._topup
+        server.TOPUP_TIME_BUDGET_SECONDS = self._budget
 
     def test_a_dimension_mismatch_says_so_and_leaves_the_index_alone(self):
         self.db.model = FakeEncoder(dim=DIM * 2)      # wrong-width vectors
@@ -335,6 +341,11 @@ class LoudFailures(unittest.TestCase):
         # The operator line used to be annotated backwards - it claimed the
         # remainder was "all covered by the top-up cache" precisely when some
         # were not, and said nothing when the count was zero.
+        # Restore, do not pop: run-tests.sh exports OBSIDIAN_VAULT_PATH, so
+        # deleting it here would leave every later test in this process reading
+        # a different vault than the one the run was pointed at.
+        saved_env = {k: os.environ.get(k)
+                     for k in ("OBSIDIAN_VAULT_PATH", "SMART_CONNECTIONS_MODEL")}
         os.environ["OBSIDIAN_VAULT_PATH"] = str(self.vault)
         os.environ["SMART_CONNECTIONS_MODEL"] = MODEL      # no identification
         real_root, real_topup = server.DEFAULT_CACHE_DIR, server.TOPUP_ENABLED
@@ -345,8 +356,11 @@ class LoudFailures(unittest.TestCase):
             with redirect_stdout(out), redirect_stderr(err):
                 rc = server.reindex_cli()
         finally:
-            os.environ.pop("OBSIDIAN_VAULT_PATH", None)
-            os.environ.pop("SMART_CONNECTIONS_MODEL", None)
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             server.DEFAULT_CACHE_DIR, server.TOPUP_ENABLED = real_root, real_topup
 
         self.assertEqual(rc, 0)
