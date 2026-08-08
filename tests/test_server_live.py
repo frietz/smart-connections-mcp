@@ -33,8 +33,27 @@ def store_present():
            (env / "multi").is_dir()
 
 
+PRESENT = store_present()
+# Skipping the entire live suite and exiting 0 is the same shape of lie the
+# tests this replaced told: green because nothing ran. run-tests.sh sets this
+# whenever live tests were actually asked for, so an absent store is a failure
+# rather than eighteen quiet skips. Set SCMCP_ALLOW_NO_STORE=1 to opt out.
+REQUIRED = os.getenv("SCMCP_REQUIRE_LIVE") == "1"
+
 needs_store = unittest.skipUnless(
-    store_present(), f"no Smart Connections store under {VAULT}")
+    PRESENT, f"no Smart Connections store under {VAULT}")
+
+
+class StoreAvailability(unittest.TestCase):
+    def test_the_live_store_is_present_when_live_tests_were_requested(self):
+        if not REQUIRED:
+            self.skipTest("live tests not required (SCMCP_REQUIRE_LIVE unset)")
+        self.assertTrue(
+            PRESENT,
+            f"live tests were requested but no Smart Connections store exists "
+            f"under {VAULT}. Every LiveStore and MCPProtocol test would skip "
+            f"and the run would report success having verified nothing. Set "
+            f"OBSIDIAN_VAULT_PATH, or SCMCP_ALLOW_NO_STORE=1 to accept it.")
 
 
 @needs_store

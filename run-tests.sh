@@ -20,10 +20,19 @@ export OBSIDIAN_VAULT_PATH="${OBSIDIAN_VAULT_PATH:-$HOME/obsidian/vault-obsidian
 
 case "${1:-all}" in
   units) target="tests.test_server_units" ;;
+  paths) target="tests.test_server_paths" ;;
   live)  target="tests.test_server_live" ;;
   all)   target="" ;;
-  *)     echo "usage: $0 [all|units|live]" >&2; exit 2 ;;
+  *)     echo "usage: $0 [all|units|paths|live]" >&2; exit 2 ;;
 esac
+
+# When live tests were asked for, a missing store is a failure rather than a
+# silent skip. Green because nothing ran is the exact lie the tests this suite
+# replaced were telling.
+if [ "${1:-all}" != "units" ] && [ "${1:-all}" != "paths" ] \
+   && [ "${SCMCP_ALLOW_NO_STORE:-0}" != "1" ]; then
+  export SCMCP_REQUIRE_LIVE=1
+fi
 
 echo "vault: $OBSIDIAN_VAULT_PATH"
 if [ -n "$target" ]; then
