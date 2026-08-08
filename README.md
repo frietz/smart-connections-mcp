@@ -195,11 +195,14 @@ Three suites, stdlib `unittest`, no test dependency to install.
 
 - **`tests/test_server_units.py`** - 40 tests, ~0.03s. Pure functions against
   synthetic blobs and metadata; runs anywhere.
-- **`tests/test_server_paths.py`** - 17 tests, ~1s. Builds a miniature 4.7.2
+- **`tests/test_server_paths.py`** - 22 tests, ~1s. Builds a miniature 4.7.2
   store in a temp directory and drives `load_embeddings` end to end against it.
   This module exists because the suite above it tested pure functions well and
   call sites not at all - and every production-severity defect this project has
-  had was a call site.
+  had was a call site. The fixture mirrors the real store where the difference
+  is load-bearing: several embedding spaces per note with only some present as
+  blobs, embedding times in epoch milliseconds, and a blob running ahead of the
+  metadata that describes it.
 - **`tests/test_server_live.py`** - 19 tests against a real vault and model.
   Covers all four tools directly and again over the MCP protocol in a separate
   process.
@@ -211,6 +214,10 @@ fix removed was never checking the requirement it claims.
 
 **A missing store fails the live suite rather than skipping it.**
 `run-tests.sh` sets `SCMCP_REQUIRE_LIVE` whenever live tests were asked for.
+**Run the tests through that script.** The guard lives in the runner, so
+`python -m unittest discover -s tests` with no store still skips the live tests
+and exits 0 - deliberate, so the hermetic suites run on a machine without
+Obsidian, but it means CI must use the script or export the variable itself.
 Green-because-nothing-ran is the exact lie told by the three `test_*.py`
 scripts this suite replaced - they pointed at absolute paths on the original
 author's machine, asserted nothing, and printed "All semantic search tests

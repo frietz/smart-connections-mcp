@@ -28,8 +28,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import server
 from server import SmartConnectionsDatabase as DB
 
-DIM = 32                      # smallest dimension _open_blob will accept
-MODEL = "test/model"
+DIM = 64                      # see make_store: wide enough to leave _open_blob
+MODEL = "test/model"          # more than one legal factorization to reject
+
+# Real `at` values are epoch MILLISECONDS (~1.78e12 in 2026), and the server
+# divides by 1000 to get the seconds it compares against file mtimes. A fixture
+# using small numbers agrees with that code by accident rather than by modelling
+# it, so a regression in the units stays green here. This sits deliberately in
+# the past relative to the notes the fixture writes, which keeps them looking
+# un-embedded exactly as they did before.
+BASE_AT_MS = 1785000000000.0                       # 2026-07-25, in millis
 
 
 def unit(n, dim=DIM, seed=0):
@@ -38,8 +46,22 @@ def unit(n, dim=DIM, seed=0):
     return m / np.linalg.norm(m, axis=1, keepdims=True)
 
 
-def make_store(tmp, fp="mf_test", n_notes=3, seed=0):
-    """A minimal but complete modern store. Returns (vault, fingerprint)."""
+def make_store(tmp, fp="mf_test", n_notes=3, seed=0, spaces=(),
+               blob_extra_rows=0):
+    """A minimal but complete modern store. Returns (vault, fingerprint).
+
+    `spaces` adds sibling embedding spaces beside `fp` under
+    `embedding.default`, which is what the real store looks like: several `mf_*`
+    names side by side, the plugin having simply stopped writing the old ones.
+    Each entry is a dict with `name` and `at`, optionally `blob` (write one, so
+    the space exists on disk) and `mtime` (touch it, so blob recency and
+    metadata recency can be made to disagree).
+
+    `blob_extra_rows` writes a source blob with more rows than the metadata
+    knows about. The plugin writes metadata and blob separately, so this is the
+    normal transient state, and it is the one that used to take the whole load
+    to an empty index.
+    """
     vault = tmp / "vault"
     env = vault / ".smart-env"
     src_dir, blk_dir = env / "smart_sources", env / "smart_blocks"
@@ -52,9 +74,12 @@ def make_store(tmp, fp="mf_test", n_notes=3, seed=0):
         rel = f"note{i}.md"
         (vault / rel).write_text(f"# Note {i}\n\n{body}\n\n## Second\n\n{body}",
                                  encoding="utf-8")
+        slots = {fp: {"file_i": i, "at": BASE_AT_MS + i}}
+        for extra in spaces:
+            slots[extra["name"]] = {"file_i": i, "at": extra["at"]}
         entry = {
             "path": rel,
-            "embedding": {"default": {fp: {"file_i": i, "at": 1000.0 + i}}},
+            "embedding": {"default": dict(slots)},
             "blocks_data": {
                 f"#Note {i}": {
                     "key": f"{rel}#Note {i}", "lines": [1, 4],
@@ -67,15 +92,27 @@ def make_store(tmp, fp="mf_test", n_notes=3, seed=0):
                      json.dumps(entry) + ",")
     (src_dir / "smart_sources.ajson").write_text("\n".join(lines) + "\n",
                                                  encoding="utf-8")
-    (src_dir / fp).write_bytes(unit(n_notes, seed=seed).tobytes())
+    (src_dir / fp).write_bytes(
+        unit(n_notes + blob_extra_rows, seed=seed).tobytes())
     (blk_dir / fp).write_bytes(unit(n_notes, seed=seed + 1).tobytes())
+
+    for extra in spaces:
+        if not extra.get("blob"):
+            continue
+        for d in (src_dir, blk_dir):
+            (d / extra["name"]).write_bytes(
+                unit(n_notes, seed=extra.get("seed", 90)).tobytes())
+        if extra.get("mtime") is not None:
+            for d in (src_dir, blk_dir):
+                os.utime(d / extra["name"], (extra["mtime"], extra["mtime"]))
     return vault, fp
 
 
-def db_for(vault, cache, fp):
+def db_for(vault, cache, fp, also=()):
     """A database whose model is already known, so no probe is needed."""
     cache.mkdir(parents=True, exist_ok=True)
-    (cache / "fingerprint-models.json").write_text(json.dumps({fp: MODEL}))
+    mapping = {name: MODEL for name in (fp,) + tuple(also)}
+    (cache / "fingerprint-models.json").write_text(json.dumps(mapping))
     db = DB(str(vault))
     db.cache_dir = cache
     db.model_name = MODEL
@@ -132,14 +169,36 @@ class CacheKeyIsPinnedToTheReadStore(unittest.TestCase):
         # to a state it never saw; using the captured signature does not. The
         # signature is scripted so the difference is a single value rather than
         # a race the test would have to win.
+        #
+        # Scripted on the settle check, not on a call count. An earlier version
+        # returned "A" for the first two calls, which encoded how many times
+        # load_embeddings happens to read the signature today - a third read
+        # added anywhere would have turned a quiet store into a moving one and
+        # gone red without a bug.
+        #
+        # The structural reads are the pre-load capture and the one settle check
+        # that follows the load. Both must see a quiet store. Any read after
+        # that is the defect itself - re-stating the store to build the cache
+        # key - so it gets a different answer.
         db = db_for(self.vault, self.cache, self.fp)
         real_sig = db._store_signature
-        seen = {"n": 0}
+        state = {"loaded": False, "settled": False}
+        real_load = db._load_modern
+
+        def load():
+            ok = real_load()
+            state["loaded"] = True
+            return ok
 
         def scripted():
-            seen["n"] += 1
-            return "A" if seen["n"] <= 2 else "B"   # quiet for the read, then moves
+            if not state["loaded"]:
+                return "A"                    # pre-load capture
+            if not state["settled"]:
+                state["settled"] = True
+                return "A"                    # the settle check - still quiet
+            return "B"                        # anything later: the store moved
 
+        db._load_modern = load
         db._store_signature = scripted
         saved = []
         real_save = db._save_to_cache
@@ -170,6 +229,97 @@ class CacheKeyIsPinnedToTheReadStore(unittest.TestCase):
         self.assertTrue(db.embeddings_loaded, "the read is still usable")
         self.assertFalse((self.cache / "meta.json").exists(),
                          "a read the store moved under must not be cached")
+
+
+class ActiveSpaceSelectionOnTheLoadPath(unittest.TestCase):
+    """Which embedding space the load picks, driven through load_embeddings.
+
+    Round 5 found the fixture wrote exactly one space, so `_newest_fingerprint`
+    and the mtime fallback could never disagree and the whole selection branch
+    at the call site was untestable. The real store carries several `mf_*` names
+    on almost every source with only some of them present as blobs, so this is
+    the normal shape, not an edge case.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scmcp-space-"))
+        self._topup = server.TOPUP_ENABLED
+        server.TOPUP_ENABLED = False
+
+    def tearDown(self):
+        server.TOPUP_ENABLED = self._topup
+
+    def test_the_newest_metadata_wins_over_the_newest_blob(self):
+        # An older space whose blob was touched last - a backup or a sync tool
+        # is enough. Choosing by blob mtime picks the stale space and every
+        # score afterwards is computed in the wrong vector space, silently,
+        # because every model here is the same width.
+        vault, fp = make_store(
+            self.tmp, fp="mf_new", n_notes=3,
+            spaces=[{"name": "mf_old", "at": BASE_AT_MS - 500_000,
+                     "blob": True, "mtime": time.time() + 5_000}])
+        db = db_for(vault, self.tmp / "cache", fp, also=("mf_old",))
+        db.load_embeddings()
+        self.assertEqual(db.active_space, "mf_new",
+                         "the load followed blob mtime instead of the "
+                         "metadata's embedding time")
+
+    def test_a_space_with_no_blob_on_disk_is_not_selected(self):
+        # Exactly the live vault on 2026-08-09: the metadata still names the
+        # pre-migration space long after its blob was deleted. Selecting it
+        # takes the whole load to an empty index.
+        vault, fp = make_store(
+            self.tmp, fp="mf_live", n_notes=3,
+            spaces=[{"name": "mf_ghost", "at": BASE_AT_MS + 900_000}])
+        db = db_for(vault, self.tmp / "cache", fp, also=("mf_ghost",))
+        db.load_embeddings()
+        self.assertEqual(db.active_space, "mf_live")
+        self.assertGreater(db.matrix.shape[0], 0, "the load returned nothing")
+
+    def test_a_future_embedding_time_does_not_win(self):
+        # One corrupt `at` in 33MB of metadata should not be able to select a
+        # space. The future space also holds the newest blob, so a horizon check
+        # that stops working cannot be rescued by the mtime fallback.
+        vault, fp = make_store(
+            self.tmp, fp="mf_real", n_notes=3,
+            spaces=[{"name": "mf_future",
+                     "at": (time.time() + 86400 * 365) * 1000.0,
+                     "blob": True, "mtime": time.time() + 9_000}])
+        db = db_for(vault, self.tmp / "cache", fp, also=("mf_future",))
+        db.load_embeddings()
+        self.assertEqual(db.active_space, "mf_real",
+                         "a timestamp in the future selected the space")
+
+    def test_embedding_times_are_read_as_epoch_millis(self):
+        # `at` is millis on disk and seconds in embed_at. Pin the conversion
+        # here: without it the only guard is a pure-function unit test, and the
+        # load path could stop dividing without anything going red.
+        vault, fp = make_store(self.tmp, n_notes=2)
+        db = db_for(vault, self.tmp / "cache", fp)
+        db.load_embeddings()
+        self.assertAlmostEqual(db.embed_at["note0.md"], BASE_AT_MS / 1000.0,
+                               delta=5.0)
+        self.assertLess(db.embed_at["note0.md"], time.time(),
+                        "an embedding time landed in the future - `at` was "
+                        "read as seconds when it is written as millis")
+
+    def test_a_blob_ahead_of_the_metadata_still_opens(self):
+        # The plugin writes metadata and blob separately, so the blob running a
+        # few rows ahead is routine. This shape is chosen so the WIDEST legal
+        # factorization is the wrong one: 4 rows of 64 against a metadata that
+        # knows of 2 offers 128 first, whose rows are two real vectors glued
+        # together. Only the unit-norm proof rejects it. With the blob exactly
+        # as long as the metadata claims there is a single candidate and the
+        # proof is never asked anything.
+        vault, fp = make_store(self.tmp, n_notes=2, blob_extra_rows=2)
+        db = db_for(vault, self.tmp / "cache", fp)
+        with redirect_stderr(io.StringIO()):
+            db.load_embeddings()
+        self.assertTrue(db.embeddings_loaded)
+        self.assertGreater(db.matrix.shape[0], 0,
+                           "a blob longer than the metadata emptied the index")
+        self.assertEqual(db.matrix.shape[1], DIM,
+                         "the proof accepted a wrong factorization")
 
 
 class WarmStartArmsTheModelCheck(unittest.TestCase):
