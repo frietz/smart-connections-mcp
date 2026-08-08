@@ -63,6 +63,14 @@ TOPUP_ENCODE_THREADS = int(os.getenv("SMART_CONNECTIONS_TOPUP_THREADS", "4"))
 # run per query. Nothing changed means an early return before the ~127ms
 # matrix rebuild, so the steady-state cost of a query is unchanged.
 TOPUP_RECHECK_SECONDS = float(os.getenv("SMART_CONNECTIONS_TOPUP_RECHECK", "5"))
+# How often a pass that deferred work may be retried. The stale set cannot
+# change on its own - top-up never writes embed_at, that is Obsidian's field -
+# so a backlog left by the time budget would otherwise sit behind the signature
+# guard until some unrelated note is edited, i.e. never drain inside a session.
+# Retrying it on the 5s edit cadence would instead put the whole time budget
+# back on the latency path of every query, so backlog retries get their own,
+# slower clock. Edits are unaffected: a new mtime changes the signature.
+TOPUP_BACKLOG_RETRY_SECONDS = float(os.getenv("SMART_CONNECTIONS_TOPUP_RETRY", "60"))
 TOPUP_MAX_CHARS = 2000   # bge-micro-v2 truncates near 512 tokens; this clears it
 TOPUP_MIN_CHARS = 50     # below this a chunk carries no retrievable signal
 TOPUP_MAX_CHUNKS = 80    # per note, so one huge daily log cannot dominate a run
@@ -106,6 +114,8 @@ class SmartConnectionsDatabase:
         self.embed_at: Dict[str, float] = {}
         self._last_check = 0.0
         self._last_signature = None
+        self._last_drain = 0.0     # when a top-up pass last ran
+        self._deferred = False     # last pass left notes un-encoded
         self.topup_added = 0      # notes embedded here because SC was behind
         self.topup_superseded = 0 # stale SC rows dropped in favour of a top-up
         self.topup_skipped = 0    # over TOPUP_MAX_NOTES this run
@@ -451,9 +461,20 @@ class SmartConnectionsDatabase:
             "|".join(f"{r}:{m:.3f}" for r, m in sorted(targets)).encode()
         ).hexdigest()
         if signature == self._last_signature:
-            return          # vault unchanged since the last pass
+            # Vault unchanged since the last pass. Return - unless that pass
+            # deferred work, in which case the signature will NEVER change on
+            # its own: the stale set is derived from Obsidian's embed_at, which
+            # top-up does not write. Recording the signature after an
+            # incomplete pass froze the retry outright; retrying it on this 5s
+            # clock would put the full time budget on every query instead. So
+            # the backlog gets its own slower cadence.
+            if (not self._deferred
+                    or now - self._last_drain < TOPUP_BACKLOG_RETRY_SECONDS):
+                return
         self._last_signature = signature
+        self._last_drain = now
         self._apply_topup(targets=targets)
+        self._deferred = bool(self.topup_skipped)
 
     def _chunk_note(self, rel: str) -> List[tuple]:
         """Split a note into heading-scoped chunks: (key_suffix, text, [start, end]).
@@ -598,11 +619,15 @@ class SmartConnectionsDatabase:
         """
         if not TOPUP_ENABLED:
             return
+        # Reset before the early return, not after it: the counters describe
+        # THIS pass, and _refresh_if_stale reads topup_skipped to decide
+        # whether work is still outstanding. Leaving a previous pass's value
+        # standing after a no-op would report a backlog that no longer exists.
+        self.topup_added = self.topup_superseded = self.topup_skipped = 0
         if targets is None:
             targets = self._stale_or_missing()
         if not targets:
             return
-        self.topup_added = self.topup_superseded = self.topup_skipped = 0
 
         cached_notes, cached_matrix = self._load_topup_cache()
         pending, done = [], {}
