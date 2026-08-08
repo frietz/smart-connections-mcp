@@ -154,11 +154,50 @@ get_context_blocks(query: "transformation through embodiment")
 
 ## How It Works
 
-1. **Reads existing embeddings** from `.smart-env/multi/*.ajson`
-2. **No re-indexing needed** - uses Smart Connections' work
-3. **Same model** (BGE-micro-v2) for query encoding
-4. **Cosine similarity** to rank results
-5. **Returns JSON** with file paths, similarity scores, metadata
+1. **Reads existing embeddings** written by the Smart Connections plugin - no
+   re-indexing of what it has already done
+2. **Handles both store layouts.** Smart Connections 4.7.2 moved from
+   `.smart-env/multi/*.ajson` (one file per note, vectors inline as JSON) to
+   `.smart-env/smart_sources/` plus flat float32 blobs addressed by row index.
+   The old tree is left in place when the plugin migrates, so reading it keeps
+   succeeding against a frozen corpus - the modern layout is preferred and the
+   legacy one warns when it is used
+3. **Uses whichever model the store was built with.** The model is identified
+   from the vectors themselves, by re-encoding one note and matching. The
+   plugin's `smart_env.json` records a model key that goes stale, and the
+   query prefix depends on getting this right - an asymmetric model queried
+   without its prefix scores worse than the one it replaced
+4. **Embeds what the plugin has not.** Smart Connections only runs while
+   Obsidian is open, so notes written in between are chunked per heading and
+   indexed here, into a separate cache merged at query time. Nothing is ever
+   written into `.smart-env/`
+5. **Cosine similarity** over one normalized matrix to rank results
+6. **Returns JSON** with file paths, similarity scores, and block text
+
+## Testing
+
+```bash
+./run-tests.sh          # everything
+./run-tests.sh units    # hermetic only - no vault, no model, no network
+```
+
+Two suites, stdlib `unittest`, no test dependency to install.
+
+- **`tests/test_server_units.py`** - 30 tests, ~0.03s. Synthetic blobs and
+  metadata; runs anywhere. Each case is a regression that actually happened and
+  says which one in its docstring.
+- **`tests/test_server_live.py`** - integration against a real vault and model.
+  Covers all four tools directly and again over the MCP protocol in a separate
+  process. Skipped automatically when no store is present, so the hermetic
+  suite still runs on a machine without Obsidian.
+
+Set `OBSIDIAN_VAULT_PATH` to test against a vault other than
+`~/obsidian/vault-obsidian`.
+
+The three `test_*.py` scripts this replaced pointed at absolute paths on the
+original author's machine, contained no assertions, and printed
+"All semantic search tests completed successfully" after finding zero results
+for every query.
 
 ## Tools Provided
 
