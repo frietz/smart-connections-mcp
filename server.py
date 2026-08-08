@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -28,6 +29,32 @@ DEFAULT_CACHE_DIR = Path(
     os.getenv("SMART_CONNECTIONS_CACHE_DIR", Path.home() / ".cache" / "smart-connections-mcp")
 )
 
+# --- top-up indexing ---------------------------------------------------------
+# Smart Connections only embeds while Obsidian is running. Everything an agent
+# session writes to the vault - daily logs, hook output, autolinked backlinks -
+# stays invisible to search until Obsidian next opens. Measured 2026-08-08:
+# 187 of 955 notes stale, 5 absent, the index 4.2 hours behind, and a note
+# authored that same evening could not be retrieved at all.
+#
+# So we embed the gap ourselves. Nothing is ever written into .smart-env -
+# Obsidian remains the sole owner of its own store. These vectors live in a
+# separate cache and are merged at query time; once Obsidian catches up, its
+# vector wins and the top-up row is dropped.
+TOPUP_ENABLED = os.getenv("SMART_CONNECTIONS_TOPUP", "1") != "0"
+TOPUP_MAX_NOTES = int(os.getenv("SMART_CONNECTIONS_TOPUP_MAX", "400"))
+# Per-run chunk ceiling. The first query of a session pays this, so it is a
+# latency budget, not a correctness knob: ~21ms/chunk measured, so 600 chunks
+# is roughly 12s worst case and usually near zero, since only notes changed
+# since the last run need work. Targets are taken NEWEST FIRST, because the
+# notes an agent session needs are the ones just written. Clearing a large
+# backlog in one pass is what `--reindex` is for.
+TOPUP_MAX_CHUNKS_PER_RUN = int(os.getenv("SMART_CONNECTIONS_TOPUP_CHUNKS", "600"))
+TOPUP_ENCODE_THREADS = int(os.getenv("SMART_CONNECTIONS_TOPUP_THREADS", "4"))
+TOPUP_MAX_CHARS = 2000   # bge-micro-v2 truncates near 512 tokens; this clears it
+TOPUP_MIN_CHARS = 50     # below this a chunk carries no retrievable signal
+TOPUP_MAX_CHUNKS = 80    # per note, so one huge daily log cannot dominate a run
+TOPUP_SKIP_DIRS = {".git", ".obsidian", ".smart-env", ".trash"}
+
 
 class SmartConnectionsDatabase:
     """Interface to Smart Connections .smart-env vector database"""
@@ -37,9 +64,18 @@ class SmartConnectionsDatabase:
         self.smart_env_path = self.vault_path / ".smart-env"
         self.multi_path = self.smart_env_path / "multi"
 
-        # Lazy load embedding model (same as Smart Connections uses)
+        # Lazy load embedding model. The name is READ FROM Smart Connections'
+        # own config rather than hardcoded: our top-up vectors have to live in
+        # the same space as the plugin's, so the two must never diverge.
+        #
+        # This is also the upgrade path. bge-micro-v2 is the smallest BGE
+        # variant (384-dim) and it is the ceiling on retrieval precision here -
+        # measured 2026-08-08, a question answered verbatim in a note still
+        # ranked ~500th. Switching the model in Obsidian's Smart Connections
+        # settings and letting it re-embed is what raises that ceiling; this
+        # server then follows automatically.
         self.model = None
-        self.model_name = 'TaylorAI/bge-micro-v2'
+        self.model_name = self._configured_model()
 
         # Vector store, built once then reused.
         # matrix rows are L2-normalized, so cosine similarity is a plain dot
@@ -53,10 +89,33 @@ class SmartConnectionsDatabase:
         self.key_index: Dict[str, int] = {}
         self.skipped = 0
         self.embeddings_loaded = False
+        # vault-relative path -> epoch seconds Smart Connections last embedded it
+        self.embed_at: Dict[str, float] = {}
+        self.topup_added = 0      # notes embedded here because SC was behind
+        self.topup_superseded = 0 # stale SC rows dropped in favour of a top-up
+        self.topup_skipped = 0    # over TOPUP_MAX_NOTES this run
 
         cache_root = DEFAULT_CACHE_DIR
         vault_id = hashlib.sha256(str(self.vault_path.resolve()).encode()).hexdigest()[:16]
         self.cache_dir = cache_root / vault_id
+
+    DEFAULT_MODEL = 'TaylorAI/bge-micro-v2'
+
+    def _configured_model(self) -> str:
+        """Model Smart Connections is actually using, from its own settings."""
+        override = os.getenv('SMART_CONNECTIONS_MODEL')
+        if override:
+            return override
+        try:
+            with open(self.smart_env_path / 'smart_env.json', 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            key = (((cfg.get('smart_sources') or {}).get('embed_model') or {})
+                   .get('transformers') or {}).get('model_key')
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+        except Exception:
+            pass
+        return self.DEFAULT_MODEL
 
     def ensure_model_loaded(self):
         """Lazy load the embedding model on first use.
@@ -123,6 +182,7 @@ class SmartConnectionsDatabase:
         self.paths = meta["paths"]
         self.lines = meta["lines"]
         self.skipped = meta.get("skipped", 0)
+        self.embed_at = meta.get("embed_at", {})
         self._finalize_masks()
         return True
 
@@ -145,6 +205,7 @@ class SmartConnectionsDatabase:
                         "keys": self.keys,
                         "paths": self.paths,
                         "lines": self.lines,
+                        "embed_at": self.embed_at,
                     },
                     f,
                 )
@@ -183,6 +244,7 @@ class SmartConnectionsDatabase:
 
         fingerprint = self._fingerprint()
         if self._load_from_cache(fingerprint):
+            self._apply_topup()
             return
 
         vectors = []
@@ -240,8 +302,17 @@ class SmartConnectionsDatabase:
 
                 vectors.append(arr / norm)
                 keys.append(key)
-                paths.append(self._resolve_path(key, item))
+                resolved_path = self._resolve_path(key, item)
+                paths.append(resolved_path)
                 lines.append(item.get("lines"))
+
+                # Note-level embed time, used to detect what Obsidian has not
+                # caught up on yet. Only source rows carry a trustworthy one.
+                if key.startswith("smart_sources:") and resolved_path:
+                    at = (model_entry.get("last_embed") or {}).get("at") \
+                        or (item.get("last_embed") or {}).get("at")
+                    if isinstance(at, (int, float)):
+                        self.embed_at[resolved_path] = at / 1000.0
 
         if vectors:
             self.matrix = np.stack(vectors).astype(np.float32, copy=False)
@@ -254,6 +325,255 @@ class SmartConnectionsDatabase:
         self.skipped = skipped
         self._finalize_masks()
         self._save_to_cache(fingerprint)
+        self._apply_topup()
+
+    # ------------------------------------------------------------------
+    # Top-up: cover what Obsidian has not embedded yet
+    # ------------------------------------------------------------------
+
+    def _stale_or_missing(self) -> List[str]:
+        """Vault notes whose content is newer than Smart Connections' vector."""
+        out = []
+        for path in self.vault_path.rglob("*.md"):
+            rel_parts = path.relative_to(self.vault_path).parts
+            if any(part in TOPUP_SKIP_DIRS for part in rel_parts):
+                continue
+            rel = "/".join(rel_parts)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            embedded = self.embed_at.get(rel)
+            # 2s slack absorbs filesystem/clock granularity between the two.
+            if embedded is None or mtime > embedded + 2:
+                out.append(rel)
+        return out
+
+    def _chunk_note(self, rel: str) -> List[tuple]:
+        """Split a note into heading-scoped chunks: (key_suffix, text, [start, end]).
+
+        Chunking is not a refinement here, it is the whole point. A single
+        whole-note vector loses to Smart Connections' own heading blocks every
+        time, and truncating a long note to fit the encoder silently drops
+        whatever sits past the cut. Measured 2026-08-08: the vault CLAUDE.md
+        embedded whole scored 0.533 and ranked 21,796th for a question its own
+        text answers, because the answer lived 4,000 characters in - past the
+        truncation point. Per-heading chunks fix both problems at once.
+
+        Mirrors Smart Connections' own `path#Heading` key shape so the rows
+        merge into the block mask and read back through the same line-range
+        path as native blocks.
+        """
+        try:
+            raw = (self.vault_path / rel).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return []
+
+        lines = raw.split("\n")
+        start_idx = 0
+        # Skip frontmatter: tags and ids are not what anyone searches for.
+        if lines and lines[0].strip() == "---":
+            for i in range(1, len(lines)):
+                if lines[i].strip() == "---":
+                    start_idx = i + 1
+                    break
+
+        chunks: List[tuple] = []
+        heading = ""
+        buf: List[str] = []
+        buf_start = start_idx + 1
+        fence = False
+
+        def flush(end_line: int):
+            if not buf:
+                return
+            text = "\n".join(buf).strip()
+            if len(text) < TOPUP_MIN_CHARS:
+                return
+            # Prepend the heading so a chunk carries its own topic.
+            body = (f"{heading}\n{text}" if heading else text)[:TOPUP_MAX_CHARS]
+            chunks.append((heading, body, [buf_start, end_line]))
+
+        for i in range(start_idx, len(lines)):
+            line = lines[i]
+            stripped = line.lstrip()
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence = not fence
+            # A heading inside a fence is code, not structure.
+            if not fence and stripped.startswith("#") and " " in stripped[:8]:
+                flush(i)
+                if len(chunks) >= TOPUP_MAX_CHUNKS:
+                    return chunks
+                heading = stripped.lstrip("#").strip()
+                buf = []
+                buf_start = i + 1
+                continue
+            buf.append(line)
+        flush(len(lines))
+        return chunks[:TOPUP_MAX_CHUNKS]
+
+    def _load_topup_cache(self):
+        """Return (index, matrix). Vectors live in .npy, never in the JSON.
+
+        Storing them as JSON lists cost 8.7s on warm start - deserializing
+        ~4k x 384 floats through Python objects. mmap'd .npy makes the same
+        load ~0.1s, which is the whole point of caching them.
+        """
+        idx_p = self.cache_dir / "topup.json"
+        vec_p = self.cache_dir / "topup.npy"
+        if not idx_p.exists() or not vec_p.exists():
+            return {}, None
+        try:
+            with open(idx_p, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            if not isinstance(index, dict):
+                return {}, None
+            matrix = np.load(vec_p, mmap_mode="r")
+            if index.get("_model") != self.model_name:
+                return {}, None   # model changed: the vector space did too
+            return index.get("notes", {}), matrix
+        except Exception:
+            return {}, None
+
+    def _save_topup_cache(self, notes: Dict[str, dict], matrix):
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp_vec = self.cache_dir / "topup.tmp.npy"
+            tmp_idx = self.cache_dir / "topup.json.tmp"
+            with open(tmp_vec, "wb") as f:
+                np.save(f, matrix)
+            with open(tmp_idx, "w", encoding="utf-8") as f:
+                json.dump({"_model": self.model_name, "notes": notes}, f)
+            tmp_vec.replace(self.cache_dir / "topup.npy")
+            tmp_idx.replace(self.cache_dir / "topup.json")
+        except Exception:
+            pass
+
+    def _apply_topup(self, unlimited: bool = False):
+        """Embed stale/missing notes and merge them into the live matrix.
+
+        Note-level only. A stale note's *block* vectors stay stale, so its
+        top-up row restores whole-note recall but not per-heading precision -
+        that is Obsidian's job when it next runs. Stated plainly rather than
+        implied: this closes the "cannot find it at all" gap, not every gap.
+        """
+        if not TOPUP_ENABLED:
+            return
+        targets = self._stale_or_missing()
+        if not targets:
+            return
+
+        cached_notes, cached_matrix = self._load_topup_cache()
+        pending, done = [], {}
+        for rel in targets:
+            try:
+                mtime = (self.vault_path / rel).stat().st_mtime
+            except OSError:
+                continue
+            hit = cached_notes.get(rel)
+            if (hit and cached_matrix is not None
+                    and abs(hit.get("mtime", -1) - mtime) < 0.001 and hit.get("chunks")):
+                rows = [c.get("row") for c in hit["chunks"]]
+                if all(isinstance(r, int) and 0 <= r < cached_matrix.shape[0] for r in rows):
+                    done[rel] = {
+                        "mtime": mtime,
+                        "chunks": [
+                            {"heading": c.get("heading"), "lines": c.get("lines"),
+                             "vec": np.asarray(cached_matrix[c["row"]], dtype=np.float32)}
+                            for c in hit["chunks"]
+                        ],
+                    }
+                    continue
+            pending.append((rel, mtime))
+
+        # Newest first: the note written five minutes ago is the one this
+        # session will be asked about.
+        pending.sort(key=lambda x: x[1], reverse=True)
+        if not unlimited and len(pending) > TOPUP_MAX_NOTES:
+            self.topup_skipped += len(pending) - TOPUP_MAX_NOTES
+            pending = pending[:TOPUP_MAX_NOTES]
+
+        if pending:
+            texts, owners = [], []
+            budget = float("inf") if unlimited else TOPUP_MAX_CHUNKS_PER_RUN
+            for rel, mtime in pending:
+                chunks = self._chunk_note(rel)
+                if len(texts) + len(chunks) > budget:
+                    # Stop on a note boundary. A half-embedded note would be
+                    # cached as complete and never revisited.
+                    self.topup_skipped += len(pending) - pending.index((rel, mtime))
+                    break
+                for heading, body, span in chunks:
+                    texts.append(body)
+                    owners.append((rel, mtime, heading, span))
+            if texts:
+                self.ensure_model_loaded()
+                import torch
+                # Batch encoding is throughput-bound, unlike the single-query
+                # path the 1-thread default was chosen for. Measured on 8 cores:
+                # 30.1ms/chunk at 1 thread, 20.8 at 4, 26.1 at 8.
+                torch.set_num_threads(max(1, TOPUP_ENCODE_THREADS))
+                try:
+                    vecs = np.asarray(
+                        self.model.encode(texts, batch_size=32, show_progress_bar=False),
+                        dtype=np.float32,
+                    )
+                finally:
+                    torch.set_num_threads(1)
+                for (rel, mtime, heading, span), vec in zip(owners, vecs):
+                    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+                    n = float(np.linalg.norm(v))
+                    if not np.isfinite(n) or n == 0.0:
+                        continue
+                    entry = done.setdefault(rel, {"mtime": mtime, "chunks": []})
+                    entry["chunks"].append(
+                        {"heading": heading, "lines": span, "vec": v / n}
+                    )
+
+        if not done:
+            return
+
+        # A topped-up note replaces its ENTIRE Smart Connections representation -
+        # the source row and every stale block row. Keeping the old blocks would
+        # let outdated text outrank the current text of the same note, which is
+        # the exact failure this whole feature exists to remove.
+        touched = set(done)
+        keep = [
+            i for i, k in enumerate(self.keys)
+            if not (self.paths[i] in touched
+                    and (k.startswith("smart_sources:") or k.startswith("smart_blocks:")))
+        ]
+        self.topup_superseded = len(self.keys) - len(keep)
+
+        add_keys, add_paths, add_lines, add_vecs = [], [], [], []
+        new_index: Dict[str, dict] = {}
+        for rel, entry in done.items():
+            rows = []
+            for c in entry["chunks"]:
+                h = c.get("heading") or ""
+                add_keys.append(f"smart_blocks:{rel}#{h}" if h else f"smart_sources:{rel}")
+                add_paths.append(rel)
+                add_lines.append(c.get("lines"))
+                rows.append({"heading": h, "lines": c.get("lines"), "row": len(add_vecs)})
+                add_vecs.append(np.asarray(c["vec"], dtype=np.float32))
+            new_index[rel] = {"mtime": entry["mtime"], "chunks": rows}
+        if not add_vecs:
+            return
+
+        add_rows = np.stack(add_vecs).astype(np.float32, copy=False)
+        base = np.asarray(self.matrix)[keep]
+        if base.shape[0] and base.shape[1] != add_rows.shape[1]:
+            return  # dimension mismatch: leave the base index untouched
+
+        self.matrix = np.vstack([base, add_rows]) if base.shape[0] else add_rows
+        self.keys = [self.keys[i] for i in keep] + add_keys
+        self.paths = [self.paths[i] for i in keep] + add_paths
+        self.lines = [self.lines[i] for i in keep] + add_lines
+        self.topup_added = len(add_keys)
+        self._finalize_masks()
+        # Row indices in new_index are positions in add_rows, so the two are
+        # written together and stay consistent by construction.
+        self._save_topup_cache(new_index, add_rows)
 
     @staticmethod
     def _resolve_path(key: str, item: dict) -> Optional[str]:
@@ -451,6 +771,15 @@ class SmartConnectionsDatabase:
             'skipped_unembedded': self.skipped,
             'cache_dir': str(self.cache_dir),
             'cache_present': (self.cache_dir / 'vectors.npy').exists(),
+            'topup': {
+                'enabled': TOPUP_ENABLED,
+                'notes_added': self.topup_added,
+                'stale_rows_superseded': self.topup_superseded,
+                'deferred_over_cap': self.topup_skipped,
+                'note': ('Notes Obsidian has not embedded yet, re-chunked and indexed '
+                         'here per heading. Obsidian remains the primary indexer; '
+                         'nothing is written into .smart-env.'),
+            },
         }
 
 
@@ -647,5 +976,41 @@ async def main():
         logger.debug("MCP server finished")
 
 
+def reindex_cli() -> int:
+    """Clear the whole top-up backlog in one pass, without a per-run cap.
+
+    The MCP path deliberately caps work so the first query of a session stays
+    responsive. That means a large backlog - the state after Obsidian has been
+    closed for a while - drains over several sessions. Run this once to drain
+    it now:
+
+        OBSIDIAN_VAULT_PATH=... python3 server.py --reindex
+    """
+    vault = os.getenv("OBSIDIAN_VAULT_PATH")
+    if not vault:
+        print("OBSIDIAN_VAULT_PATH is not set", file=sys.stderr)
+        return 1
+
+    db = SmartConnectionsDatabase(vault)
+    start = time.time()
+    db.load_embeddings()          # bounded pass, plus whatever the cache holds
+    db.embeddings_loaded = True
+    db._apply_topup(unlimited=True)   # then drain the remainder
+
+    s = db.stats()
+    t = s["topup"]
+    print(f"vectors        : {s['vectors']}")
+    print(f"chunks added   : {t['notes_added']}")
+    print(f"stale dropped  : {t['stale_rows_superseded']}")
+    print(f"deferred       : {t['deferred_over_cap']}")
+    print(f"elapsed        : {time.time() - start:.1f}s")
+    remaining = len(db._stale_or_missing())
+    print(f"still stale    : {remaining}"
+          + ("  <- all covered by the top-up cache" if remaining else ""))
+    return 0
+
+
 if __name__ == "__main__":
+    if "--reindex" in sys.argv:
+        sys.exit(reindex_cli())
     asyncio.run(main())
